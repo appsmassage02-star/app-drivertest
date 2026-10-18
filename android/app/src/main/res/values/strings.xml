@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">طلبات البيت - دليفري</string>
-    <string name="title_activity_main">طلبات البيت - دليفري</string>
-    <string name="package_name">com.talabat.driver</string>
-    <string name="custom_url_scheme">com.talabat.driver</string>
+    <string name="app_name">طلبات البيت - اختبار</string>
+    <string name="title_activity_main">طلبات البيت - اختبار</string>
+    <string name="package_name">com.talabatalbayt.driver.dev</string>
+    <string name="custom_url_scheme">com.talabatalbayt.driver.dev</string>
 </resources>

@@ -1,4 +1,4 @@
-package com.talabat.driver;
+package com.talabatalbayt.driver.dev;
 
 import com.getcapacitor.BridgeActivity;
 
