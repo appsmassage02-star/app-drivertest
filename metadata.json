@@ -1,0 +1,6 @@
+{
+  "name": "تطبيق الدليفري - طلبات البيت",
+  "description": "تطبيق الدليفري المخصص لإدارة وقبول طلبات التوصيل وتتبع الحالات وملف السائق وربطه بقاعدة بيانات Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
