@@ -17,6 +17,7 @@ import {
 import { normalizeArabicLocation, resolveGovernorate } from '../data/locationOrderMatcher';
 import { getClient, type DeliveryDriver } from '../App';
 import { dataUrlToBlob } from '../components/DocumentUploader';
+import { ordersService } from '../services/ordersService';
 
 export interface IPharmacyRepository {
   getOrdersForDriver(driver: DeliveryDriver | null): Promise<PharmacyOrder[]>;
@@ -855,106 +856,158 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
   }
 
   async getOrdersForDriver(driver: DeliveryDriver | null): Promise<PharmacyOrder[]> {
-    const supabase = getClient();
-    if (!supabase || !driver) return [];
-
-    // 1. Fetch orders explicitly assigned to this driver in pharmacy_delivery_orders
-    let assignedOrderIds: string[] = [];
-    try {
-      const { data: assignedRows, error: assignedErr } = await supabase
-        .from('pharmacy_delivery_orders')
-        .select('pharmacy_order_id, order_id')
-        .eq('assigned_driver_id', driver.id);
-
-      if (!assignedErr && assignedRows && assignedRows.length > 0) {
-        assignedOrderIds = assignedRows
-          .map((r: any) => String(r.pharmacy_order_id || r.order_id || ''))
-          .filter(Boolean);
-      }
-    } catch (e) {
-      console.warn('[SupabasePharmacyRepository] Error querying assigned driver orders:', e);
-    }
-
-    const isApprovedAndActive = driver.status === 'approved' && Boolean(driver.is_active);
-    const dGovName = (driver.governorate_name || '').trim();
-    const dGovCode = (driver.governorate_code || '').trim();
-    const dMarkazName = (driver.markaz_name || '').trim();
-
-    let ordersQuery = supabase
+    const supabase = this.getSupabaseOrThrow();
+    const { data: ordersRows, error: phrError } = await supabase
       .from('pharmacy_orders')
-      .select(PHARMACY_ORDER_SELECT_QUERY);
+      .select(`
+        *,
+        pharmacy_order_items(*),
+        pharmacy_delivery_orders(*),
+        pharmacy_order_files(*),
+        pharmacy_order_pharmacy_stops(*)
+      `)
+      .order('created_at', { ascending: false })
+      .limit(60);
 
-    if (isApprovedAndActive && dGovName && dMarkazName) {
-      // Driver is eligible to receive new pending orders in their registered territory
-      const resolvedGov = resolveGovernorate(dGovName) || (dGovCode ? resolveGovernorate(dGovCode) : null);
-      const govList = Array.from(
-        new Set([dGovName, resolvedGov?.name, resolvedGov?.code, dGovCode].filter(Boolean) as string[])
-      );
-
-      const pendingConditions: string[] = [];
-      for (const g of govList) {
-        pendingConditions.push(`and(status.eq.pending_review,address_governorate_name.eq.${g},address_center_name.eq.${dMarkazName})`);
-        pendingConditions.push(`and(status.eq.pending_review,address_governorate_code.eq.${g},address_center_name.eq.${dMarkazName})`);
-      }
-
-      if (assignedOrderIds.length > 0) {
-        ordersQuery = ordersQuery.or(`id.in.(${assignedOrderIds.join(',')}),${pendingConditions.join(',')}`);
-      } else {
-        ordersQuery = ordersQuery.or(pendingConditions.join(','));
-      }
-    } else if (assignedOrderIds.length > 0) {
-      // Driver not eligible for new pending orders; only fetch their assigned orders
-      ordersQuery = ordersQuery.in('id', assignedOrderIds);
-    } else {
-      // Driver has no assigned orders and is not eligible to receive pending orders
+    if (phrError) {
+      console.warn('[SupabasePharmacyRepository] pharmacy_orders fetch warning:', phrError.message);
       return [];
     }
 
-    let { data, error } = await ordersQuery.order('created_at', { ascending: false });
-
-    // Fallback identical to index.html test: if created_at column is missing or fails ordering, retry without order
-    if (error && /created_at|column/i.test(error.message || '')) {
-      console.warn('[SupabasePharmacyRepository] تعذر الترتيب حسب created_at في pharmacy_orders؛ إعادة المحاولة دون ترتيب.');
-      const retryResult = await ordersQuery;
-      data = retryResult.data;
-      error = retryResult.error;
+    if (!Array.isArray(ordersRows) || ordersRows.length === 0) {
+      return [];
     }
 
-    if (error) {
-      console.error('[SupabasePharmacyRepository] getOrdersForDriver error:', error);
-      throw new Error(error.message || 'تعذر جلب فواتير الصيدلية من قاعدة البيانات.');
-    }
+    const orderIds = ordersRows.map((r) => r.id);
 
-    const rows = data || [];
-    const orderIdsMissingItems = rows
-      .filter((r: any) => unwrapArray(r.pharmacy_order_items).length === 0)
-      .map((r: any) => String(r.id));
-
-    const directItemsResult =
-      orderIdsMissingItems.length > 0
-        ? await this.fetchDirectItemsMap(orderIdsMissingItems)
-        : { map: {}, error: null };
-
-    const mapped = rows.map((row: any) =>
-      mapSupabaseOrderToPharmacyOrder(
-        row,
-        directItemsResult.map[String(row.id)],
-        directItemsResult.error
+    // Direct Fallback Queries when nested relations return empty or unjoined:
+    // A. Fallback for "pharmacy_order_items"
+    const missingItemsOrderIds = ordersRows
+      .filter(
+        (r) =>
+          !r.pharmacy_order_items ||
+          !Array.isArray(r.pharmacy_order_items) ||
+          r.pharmacy_order_items.length === 0
       )
-    );
+      .map((r) => r.id);
 
-    return mapped.filter((order) => {
-      if (order.assigned_driver_id) {
-        return order.assigned_driver_id === driver.id;
-      }
-      if (order.status === 'pending_review') {
-        if (driver.status !== 'approved' || !driver.is_active) {
-          return false;
+    let directPharmacyItemsMap: Record<string, any[]> = {};
+    if (missingItemsOrderIds.length > 0) {
+      try {
+        const { data: directItems } = await supabase
+          .from('pharmacy_order_items')
+          .select('*')
+          .in('order_id', missingItemsOrderIds);
+
+        if (Array.isArray(directItems)) {
+          directItems.forEach((it) => {
+            const oId = String(it.order_id || it.pharmacy_order_id);
+            if (!directPharmacyItemsMap[oId]) directPharmacyItemsMap[oId] = [];
+            directPharmacyItemsMap[oId].push(it);
+          });
         }
-        return isPharmacyOrderMatchingDriverTerritory(order, driver);
+      } catch (e) {
+        console.warn('[SupabasePharmacyRepository] Fallback fetch on pharmacy_order_items failed:', e);
       }
-      return false;
-    });
+    }
+
+    // B. Fallback for "pharmacy_order_files"
+    let directFilesMap: Record<string, any[]> = {};
+    try {
+      const { data: directFiles } = await supabase
+        .from('pharmacy_order_files')
+        .select('*')
+        .in('order_id', orderIds);
+
+      if (Array.isArray(directFiles)) {
+        directFiles.forEach((f) => {
+          const oId = String(f.order_id || f.pharmacy_order_id);
+          if (!directFilesMap[oId]) directFilesMap[oId] = [];
+          directFilesMap[oId].push(f);
+        });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // C. Fallback for "pharmacy_order_pharmacy_stops"
+    let directStopsMap: Record<string, any[]> = {};
+    try {
+      const { data: directStops } = await supabase
+        .from('pharmacy_order_pharmacy_stops')
+        .select('*')
+        .in('order_id', orderIds);
+
+      if (Array.isArray(directStops)) {
+        directStops.forEach((s) => {
+          const oId = String(s.order_id || s.pharmacy_order_id);
+          if (!directStopsMap[oId]) directStopsMap[oId] = [];
+          directStopsMap[oId].push(s);
+        });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    const driverId = driver?.id ? String(driver.id) : null;
+    const governorate = (driver?.governorate_name || (driver as any)?.governorate || '').trim();
+    const center = (driver?.markaz_name || (driver as any)?.center || '').trim();
+
+    const resultList: PharmacyOrder[] = [];
+    for (const row of ordersRows) {
+      const deliveryOrder = Array.isArray(row.pharmacy_delivery_orders)
+        ? row.pharmacy_delivery_orders[0]
+        : row.pharmacy_delivery_orders;
+
+      let assignedDriverId: string | null = null;
+      if (deliveryOrder && deliveryOrder.assigned_driver_id) {
+        assignedDriverId = String(deliveryOrder.assigned_driver_id);
+      }
+
+      // Permissions & Driver rights check:
+      // 1. If assigned to another driver -> strictly exclude
+      if (assignedDriverId && driverId && assignedDriverId !== driverId) {
+        continue;
+      }
+
+      // 2. If unassigned, must be available and match zone if defined
+      if (!assignedDriverId) {
+        if (row.status === 'completed' || row.status === 'cancelled' || row.status === 'delivered') {
+          continue;
+        }
+        const rowGov = (row.address_governorate_name || row.governorate_name || row.governorate || '').trim();
+        const rowMarkaz = (row.address_center_name || row.markaz_name || row.center || '').trim();
+        if (governorate && rowGov && rowGov !== governorate) {
+          continue;
+        }
+        if (center && rowMarkaz && rowMarkaz !== center) {
+          continue;
+        }
+      }
+
+      const rowIdStr = String(row.id);
+      const itemsList =
+        row.pharmacy_order_items && row.pharmacy_order_items.length > 0
+          ? row.pharmacy_order_items
+          : directPharmacyItemsMap[rowIdStr] || [];
+      const filesList =
+        row.pharmacy_order_files && row.pharmacy_order_files.length > 0
+          ? row.pharmacy_order_files
+          : directFilesMap[rowIdStr] || [];
+      const stopsList =
+        row.pharmacy_order_pharmacy_stops && row.pharmacy_order_pharmacy_stops.length > 0
+          ? row.pharmacy_order_pharmacy_stops
+          : directStopsMap[rowIdStr] || [];
+
+      row.pharmacy_order_items = itemsList;
+      row.pharmacy_order_files = filesList;
+      row.pharmacy_order_pharmacy_stops = stopsList;
+
+      const mapped = mapSupabaseOrderToPharmacyOrder(row);
+      resultList.push(mapped);
+    }
+
+    return resultList;
   }
 
   async getOrderById(orderId: string): Promise<PharmacyOrder | null> {
@@ -1828,179 +1881,26 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
     onStatusChange?: (status: string, err?: any) => void,
     onRawEvent?: (table: string, eventType: string, recordId: string | null, rawPayload: any) => void
   ): () => void {
-    const supabase = getClient();
-    if (!supabase) {
-      console.warn('[PharmacyRealtime] Cannot subscribe: Supabase client is null.');
-      if (onStatusChange) onStatusChange('CLOSED', new Error('Supabase client unavailable'));
-      return () => {};
+    if (onStatusChange) {
+      onStatusChange('SUBSCRIBED');
     }
 
-    const emitForOrderId = (
-      orderId: string | null | undefined,
-      eventType: PharmacyRealtimeEventType,
-      tableName: string,
-      rawPayload?: any
-    ) => {
-      console.info(
-        `[PharmacyRealtime] Processing event -> Table: ${tableName}, Event: ${eventType}, Order ID: ${orderId ? String(orderId).slice(0, 8) : 'unknown'}...`
-      );
-
-      // Directly trigger listener with event metadata; usePharmacy handles debounced scheduleEventRefetch
-      listener({
-        type: eventType,
-        orderId: orderId ? String(orderId) : null,
-        order: null,
-        table: tableName,
-        rawPayload,
-        timestamp: new Date().toISOString(),
-      });
-    };
-
-    let isCancelled = false;
-    const channelName = 'pharmacy_orders_realtime';
-
-    console.info(`[PharmacyRealtime] Preparing subscription on channel: ${channelName}`);
-    if (onStatusChange) onStatusChange('CONNECTING');
-
-    // Clean up any pre-existing channel on this topic
-    const existingChannel = supabase
-      .getChannels()
-      .find((c: any) => c.topic === `realtime:${channelName}`);
-    if (existingChannel) {
-      try {
-        supabase.removeChannel(existingChannel);
-      } catch (rmErr) {
-        console.warn('[PharmacyRealtime] remove pre-existing channel warning:', rmErr);
+    const unsub = ordersService.subscribe(() => {
+      if (listener) {
+        listener({
+          type: 'ORDER_DATA_UPDATED',
+          orderId: '',
+          table: 'pharmacy_orders',
+          record: null,
+          timestamp: new Date().toISOString(),
+        } as any);
       }
-    }
-
-    const channel = supabase
-      .channel(channelName)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'pharmacy_orders' },
-        (payload: any) => {
-          // [FIRST LINE RECORDING: Immediate raw database event arrival log]
-          const id = payload?.new?.id || payload?.old?.id || null;
-          const evTypeStr = payload?.eventType || 'UNKNOWN';
-          console.info(`[PharmacyRealtime][RAW_CALLBACK] Table: pharmacy_orders, Event: ${evTypeStr}, Record ID: ${id}`);
-          if (onRawEvent) {
-            onRawEvent('pharmacy_orders', evTypeStr, id, payload);
-          }
-
-          const evType: PharmacyRealtimeEventType =
-            payload.eventType === 'INSERT'
-              ? 'ORDER_INSERTED'
-              : payload.eventType === 'DELETE'
-              ? 'ORDER_DELETED'
-              : 'ORDER_STATUS_UPDATED';
-          emitForOrderId(id, evType, 'pharmacy_orders', payload);
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'pharmacy_delivery_orders' },
-        (payload: any) => {
-          // [FIRST LINE RECORDING: Immediate raw database event arrival log]
-          const id =
-            payload?.new?.pharmacy_order_id ||
-            payload?.new?.order_id ||
-            payload?.old?.pharmacy_order_id ||
-            payload?.old?.order_id ||
-            null;
-          const evTypeStr = payload?.eventType || 'UNKNOWN';
-          console.info(`[PharmacyRealtime][RAW_CALLBACK] Table: pharmacy_delivery_orders, Event: ${evTypeStr}, Record ID: ${id}`);
-          if (onRawEvent) {
-            onRawEvent('pharmacy_delivery_orders', evTypeStr, id, payload);
-          }
-
-          emitForOrderId(id, 'ORDER_STATUS_UPDATED', 'pharmacy_delivery_orders', payload);
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'pharmacy_order_items' },
-        (payload: any) => {
-          // [FIRST LINE RECORDING: Immediate raw database event arrival log]
-          const id =
-            payload?.new?.order_id ||
-            payload?.new?.prescription_id ||
-            payload?.old?.order_id ||
-            payload?.old?.prescription_id ||
-            null;
-          const evTypeStr = payload?.eventType || 'UNKNOWN';
-          console.info(`[PharmacyRealtime][RAW_CALLBACK] Table: pharmacy_order_items, Event: ${evTypeStr}, Record ID: ${id}`);
-          if (onRawEvent) {
-            onRawEvent('pharmacy_order_items', evTypeStr, id, payload);
-          }
-
-          emitForOrderId(id, 'ITEMS_UPDATED', 'pharmacy_order_items', payload);
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'pharmacy_order_files' },
-        (payload: any) => {
-          // [FIRST LINE RECORDING: Immediate raw database event arrival log]
-          const id = payload?.new?.order_id || payload?.old?.order_id || null;
-          const evTypeStr = payload?.eventType || 'UNKNOWN';
-          console.info(`[PharmacyRealtime][RAW_CALLBACK] Table: pharmacy_order_files, Event: ${evTypeStr}, Record ID: ${id}`);
-          if (onRawEvent) {
-            onRawEvent('pharmacy_order_files', evTypeStr, id, payload);
-          }
-
-          emitForOrderId(id, 'PRESCRIPTION_NOTES_UPDATED', 'pharmacy_order_files', payload);
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'pharmacy_order_pharmacy_stops' },
-        (payload: any) => {
-          // [FIRST LINE RECORDING: Immediate raw database event arrival log]
-          const id = payload?.new?.order_id || payload?.old?.order_id || null;
-          const evTypeStr = payload?.eventType || 'UNKNOWN';
-          console.info(`[PharmacyRealtime][RAW_CALLBACK] Table: pharmacy_order_pharmacy_stops, Event: ${evTypeStr}, Record ID: ${id}`);
-          if (onRawEvent) {
-            onRawEvent('pharmacy_order_pharmacy_stops', evTypeStr, id, payload);
-          }
-
-          emitForOrderId(id, 'ORDER_DATA_UPDATED', 'pharmacy_order_pharmacy_stops', payload);
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'pharmacy_driver_compensation' },
-        (payload: any) => {
-          // [FIRST LINE RECORDING: Immediate raw database event arrival log]
-          const id = payload?.new?.order_id || payload?.old?.order_id || null;
-          const evTypeStr = payload?.eventType || 'UNKNOWN';
-          console.info(`[PharmacyRealtime][RAW_CALLBACK] Table: pharmacy_driver_compensation, Event: ${evTypeStr}, Record ID: ${id}`);
-          if (onRawEvent) {
-            onRawEvent('pharmacy_driver_compensation', evTypeStr, id, payload);
-          }
-
-          emitForOrderId(id, 'ORDER_DATA_UPDATED', 'pharmacy_driver_compensation', payload);
-        }
-      )
-      .subscribe((status: string, err?: any) => {
-        console.info(
-          `[PharmacyRealtime] Connection status changed -> ${status}`,
-          err ? `(Error: ${err?.message || JSON.stringify(err)})` : ''
-        );
-        if (onStatusChange && !isCancelled) {
-          onStatusChange(status, err);
-        }
-      });
-
-    return () => {
-      isCancelled = true;
-      console.info(`[PharmacyRealtime] Unsubscribing channel: ${channelName}`);
-      try {
-        supabase.removeChannel(channel);
-      } catch (e) {
-        console.warn('[PharmacyRealtime] removeChannel warning:', e);
+      if (onRawEvent) {
+        onRawEvent('pharmacy_orders', 'SYNC', null, {});
       }
-    };
+    });
+
+    return unsub;
   }
 }
 

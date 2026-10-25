@@ -373,19 +373,7 @@ export function usePharmacy({ currentDriver, deliveryEnabled, onToast }: UsePhar
     };
   }, [realtimeSessionKey, currentDriver?.id, loadPharmacyOrders, notify, addDiagnosticLog]);
 
-  // Compensatory sync on network reconnect event
-  useEffect(() => {
-    const handleOnline = () => {
-      addDiagnosticLog({
-        level: 'info',
-        message: 'تم رصد عودة اتصال الشبكة (online) — تنفيذ مزامنة تعويضية...',
-      });
-      void loadPharmacyOrders();
-      setRealtimeSessionKey((k) => k + 1);
-    };
-    window.addEventListener('online', handleOnline);
-    return () => window.removeEventListener('online', handleOnline);
-  }, [loadPharmacyOrders, addDiagnosticLog]);
+  // Phase 1: Online and visibility background order sync listeners removed pending Phase 2 replacement
 
 
   // Accept Pharmacy Order

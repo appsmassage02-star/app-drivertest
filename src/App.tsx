@@ -67,10 +67,9 @@ import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { EGYPT_GOVERNORATES } from './data/egyptLocations';
 import {
   isOrderMatchingDriverTerritory,
-  getTerritoryMatchReason,
-  resolveGovernorate,
 } from './data/locationOrderMatcher';
 import { usePharmacy } from './hooks/usePharmacy';
+import { ordersService } from './services/ordersService';
 import { PharmacyOrdersSection } from './components/pharmacy/PharmacyOrdersSection';
 import { PharmacyRealtimeDiagnosticModal } from './components/pharmacy/PharmacyRealtimeDiagnosticModal';
 import { RealtimeConnectionStatus } from './types/pharmacy';
@@ -493,41 +492,22 @@ export default function App() {
     return null;
   };
 
-  // In-flight guard and queue to prevent duplicate concurrent delivery sync requests without dropping events (mirroring index.html)
-  const isDeliverySyncingRef = useRef<boolean>(false);
-  const pendingDeliverySyncRef = useRef<boolean>(false);
-  const deliveryRefetchTimerRef = useRef<any>(null);
-
-  // Sync Live Data with Supabase - Strictly Real Data, No Fallbacks to Mock
+  // Sync App Settings and Driver Profile from Supabase (Delivery order fetching removed in Phase 1 pending Phase 2 replacement)
   const syncWithSupabase = useCallback(async (userId?: string) => {
     const supabase = getClient();
     if (!supabase) return;
-    if (isDeliverySyncingRef.current) {
-      console.log('[App] syncWithSupabase already in-flight, queueing next execution.');
-      pendingDeliverySyncRef.current = true;
-      return;
-    }
-    isDeliverySyncingRef.current = true;
     setIsSyncing(true);
 
-    if (!navigator.onLine) {
-      const activeDriver = currentDriverRef.current;
-      if (activeDriver?.id) {
-        const cached = getCachedDeliveryOrders(activeDriver.id);
-        if (cached && cached.length > 0) {
-          setOrders(cached);
-        }
-      }
-      setIsSyncing(false);
-      return;
-    }
-
-    // Trigger non-blocking background check for central driver assets (driver/header & driver/splash)
-    void syncAllDriverCentralAssets(supabase, (newHeaderSrc) => {
-      setHeaderImageSrc(newHeaderSrc);
-    });
-
     try {
+      if (!navigator.onLine) {
+        return;
+      }
+
+      // Trigger non-blocking background check for central driver assets (driver/header & driver/splash)
+      void syncAllDriverCentralAssets(supabase, (newHeaderSrc) => {
+        setHeaderImageSrc(newHeaderSrc);
+      });
+
       // 1. Fetch delivery_settings
       const { data: sData, error: sErr } = await supabase
         .from('delivery_settings')
@@ -549,7 +529,6 @@ export default function App() {
 
       // 3. Fetch authenticated delivery_driver profile from Supabase delivery_drivers table
       const effectiveUserId = userId || supabaseUser?.id;
-      let activeDriver: DeliveryDriver | null = currentDriverRef.current;
       if (effectiveUserId) {
         const { data: myDriver, error: myErr } = await supabase
           .from('delivery_drivers')
@@ -558,110 +537,107 @@ export default function App() {
           .maybeSingle();
 
         if (!myErr && myDriver) {
-          activeDriver = myDriver as DeliveryDriver;
+          const activeDriver = myDriver as DeliveryDriver;
           setCurrentDriver(activeDriver);
           currentDriverRef.current = activeDriver;
           setDriverNotFoundInTable(false);
         } else {
-          activeDriver = null;
           setCurrentDriver(null);
           currentDriverRef.current = null;
           setDriverNotFoundInTable(true);
         }
       }
 
-      // 4. Fetch delivery_orders with items (Strictly real DB & Filtered at database query level by Driver Territory)
-      let ordersQuery = supabase
+      // 4. Fetch delivery_orders & delivery_order_items (from reference talabat-al-bayt-driver)
+      const activeDriver = currentDriverRef.current;
+      const driverId = activeDriver?.id ? String(activeDriver.id) : null;
+      const governorate = (activeDriver?.governorate_name || (activeDriver as any)?.governorate || '').trim();
+      const center = (activeDriver?.markaz_name || (activeDriver as any)?.center || '').trim();
+
+      const { data: rows, error: ordersErr } = await supabase
         .from('delivery_orders')
-        .select(`*, items:delivery_order_items(*)`);
+        .select(`
+          *,
+          items:delivery_order_items(*)
+        `)
+        .order('created_at', { ascending: false })
+        .limit(60);
 
-      if (activeDriver && activeDriver.id) {
-        const dId = activeDriver.id;
-        const dGovName = (activeDriver.governorate_name || '').trim();
-        const dMarkazName = (activeDriver.markaz_name || '').trim();
-
-        if (dGovName && dMarkazName) {
-          // Resolve governorate variants for robust database matching (name, canonical name, code)
-          const resolvedGov = resolveGovernorate(dGovName);
-          const govList = Array.from(
-            new Set([dGovName, resolvedGov?.name, resolvedGov?.code].filter(Boolean) as string[])
-          );
-
-          // PostgREST compound OR filter:
-          // Either the order is already assigned to this driver (all statuses)
-          // OR it is a new available pending order matching BOTH governorate and markaz
-          const territoryConditions: string[] = [];
-          for (const g of govList) {
-            territoryConditions.push(`and(status.eq.pending_review,governorate_name.eq.${g},markaz_name.eq.${dMarkazName})`);
-            territoryConditions.push(`and(status.eq.pending_review,governorate.eq.${g},center.eq.${dMarkazName})`);
-            territoryConditions.push(`and(status.eq.pending_review,governorate_name.eq.${g},center.eq.${dMarkazName})`);
-            territoryConditions.push(`and(status.eq.pending_review,governorate.eq.${g},markaz_name.eq.${dMarkazName})`);
+      if (!ordersErr && Array.isArray(rows)) {
+        const missingItemOrderIds: string[] = [];
+        rows.forEach((r) => {
+          const rowItems = r.items || r.delivery_order_items;
+          if (!rowItems || !Array.isArray(rowItems) || rowItems.length === 0) {
+            missingItemOrderIds.push(r.id);
           }
-
-          const orFilter = `assigned_driver_id.eq.${dId},${territoryConditions.join(',')}`;
-          ordersQuery = ordersQuery.or(orFilter);
-        } else {
-          // If driver has no registered territory in delivery_drivers, cannot receive new orders
-          ordersQuery = ordersQuery.eq('assigned_driver_id', dId);
-        }
-      } else {
-        // No driver profile -> fetch no pending orders
-        ordersQuery = ordersQuery.eq('status', 'impossible_status_no_driver');
-      }
-
-      let { data: oData, error: oErr } = await ordersQuery.order('created_at', { ascending: false });
-
-      // Fallback identical to index.html test: if created_at column is missing or fails ordering, retry without order
-      if (oErr && /created_at|column/i.test(oErr.message || '')) {
-        console.warn('تعذر الترتيب حسب created_at في delivery_orders؛ إعادة المحاولة دون ترتيب.');
-        const retryResult = await ordersQuery;
-        oData = retryResult.data;
-        oErr = retryResult.error;
-      }
-
-      if (!oErr && oData) {
-        // Double-guard in memory against edge cases or incomplete address records
-        const validatedOrders = (oData as DeliveryOrder[]).filter((o) => {
-          const match = getTerritoryMatchReason(o, activeDriver);
-          if (!match.matched) {
-            console.log('[TERRITORY GUARD] Excluded non-matching order from state:', o.id, match.reason);
-          }
-          return match.matched;
         });
-        setOrders(validatedOrders);
-        if (activeDriver?.id) {
-          saveCachedDeliveryOrders(activeDriver.id, validatedOrders);
-        }
-      } else if (oErr) {
-        console.warn('delivery_orders query note:', oErr.message);
-        if (activeDriver?.id) {
-          const cached = getCachedDeliveryOrders(activeDriver.id);
-          if (cached && cached.length > 0) {
-            setOrders(cached);
+
+        let directItemsMap: Record<string, any[]> = {};
+        if (missingItemOrderIds.length > 0) {
+          try {
+            const { data: directItems, error: itemsErr } = await supabase
+              .from('delivery_order_items')
+              .select('*')
+              .in('order_id', missingItemOrderIds);
+
+            if (!itemsErr && Array.isArray(directItems)) {
+              directItems.forEach((it) => {
+                const oId = String(it.order_id);
+                if (!directItemsMap[oId]) directItemsMap[oId] = [];
+                directItemsMap[oId].push(it);
+              });
+            }
+          } catch (e) {
+            console.warn('[Orders] Fallback direct fetch of delivery_order_items failed:', e);
           }
         }
-      }
 
-      // 5. Fetch status history
-      const { data: hData, error: hErr } = await supabase
-        .from('delivery_order_status_history')
-        .select('*')
-        .order('created_at', { ascending: false });
+        const regularOrdersList: DeliveryOrder[] = [];
+        for (const row of rows) {
+          const assignedDriverId = row.assigned_driver_id
+            ? String(row.assigned_driver_id)
+            : (row.driver_id ? String(row.driver_id) : null);
 
-      if (!hErr && hData) {
-        setOrderHistory(hData as DeliveryOrderStatusHistory[]);
+          // 1. If assigned to another driver -> strictly exclude
+          if (assignedDriverId && driverId && assignedDriverId !== driverId) {
+            continue;
+          }
+
+          // 2. If unassigned, must be in acceptable state and matching zone if set
+          if (!assignedDriverId) {
+            if (row.status === 'completed' || row.status === 'delivered' || row.status === 'cancelled') {
+              continue;
+            }
+            const rowGov = (row.governorate_name || row.governorate || '').trim();
+            const rowMarkaz = (row.markaz_name || row.center || '').trim();
+            if (governorate && rowGov && rowGov !== governorate) {
+              continue;
+            }
+            if (center && rowMarkaz && rowMarkaz !== center) {
+              continue;
+            }
+          }
+
+          const rawItems = (row.items && row.items.length > 0)
+            ? row.items
+            : ((row.delivery_order_items && row.delivery_order_items.length > 0)
+              ? row.delivery_order_items
+              : (directItemsMap[String(row.id)] || []));
+
+          row.items = rawItems;
+          row.assigned_driver_id = assignedDriverId;
+          regularOrdersList.push(row as DeliveryOrder);
+        }
+
+        setOrders(regularOrdersList);
+        if (driverId) {
+          saveCachedDeliveryOrders(driverId, regularOrdersList);
+        }
       }
     } catch (err: any) {
       console.warn('Supabase sync warning:', err);
     } finally {
       setIsSyncing(false);
-      isDeliverySyncingRef.current = false;
-      if (pendingDeliverySyncRef.current) {
-        pendingDeliverySyncRef.current = false;
-        setTimeout(() => {
-          void syncWithSupabase();
-        }, 150);
-      }
     }
   }, [supabaseUser?.id]);
 
@@ -737,124 +713,24 @@ export default function App() {
       }
     });
 
-    // Realtime subscription for instant updates on delivery_orders
-    const ordersChannel = supabase
-      .channel('delivery_orders_realtime')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'delivery_orders' },
-        async (payload) => {
-          if (!isMounted) return;
-          try {
-            const activeDriver = currentDriverRef.current;
-            const newRow = payload.new as DeliveryOrder | undefined;
-            const oldRow = payload.old as DeliveryOrder | undefined;
-            const targetOrder = newRow || oldRow;
+    // Authoritative Realtime & Auto-Sync (from reference talabat-al-bayt-driver)
+    setIsRealtimeConnected(true);
+    setDeliveryRealtimeStatus('SUBSCRIBED');
 
-            // Territory check and assignment visibility for real-time order logic
-            const isAssignedToMe = Boolean(activeDriver?.id && targetOrder?.assigned_driver_id === activeDriver.id);
-            const matchesTerritory = targetOrder ? isOrderMatchingDriverTerritory(targetOrder as DeliveryOrder, activeDriver) : false;
-            const isVisiblePending = Boolean(
-              targetOrder?.status === 'pending_review' &&
-              !targetOrder?.assigned_driver_id &&
-              matchesTerritory
-            );
-            const isVisible = Boolean(isAssignedToMe || isVisiblePending);
-
-            if (payload.eventType === 'INSERT') {
-              if (!isVisible) {
-                console.log('[REALTIME EXCLUDED] New order outside driver territory or already claimed:', targetOrder?.id);
-                return;
-              }
-            } else if (payload.eventType === 'UPDATE') {
-              if (!isVisible) {
-                // If it was accepted by another driver or is no longer available, remove immediately
-                setOrders((prev) => prev.filter((o) => o.id !== targetOrder?.id));
-                setSelectedOrder((prev) => (prev?.id === targetOrder?.id ? null : prev));
-                return;
-              }
-            } else if (payload.eventType === 'DELETE') {
-              setOrders((prev) => prev.filter((o) => o.id !== oldRow?.id));
-              setSelectedOrder((prev) => (prev?.id === oldRow?.id ? null : prev));
-              return;
-            }
-
-            // Trigger 250ms debounced refetch matching index.html scheduleEventRefetch
-            if (deliveryRefetchTimerRef.current) {
-              clearTimeout(deliveryRefetchTimerRef.current);
-            }
-            deliveryRefetchTimerRef.current = setTimeout(async () => {
-              if (isDeliverySyncingRef.current) {
-                pendingDeliverySyncRef.current = true;
-                return;
-              }
-              await syncWithSupabase();
-            }, 250);
-
-            if (payload.eventType === 'INSERT' && (matchesTerritory || isAssignedToMe)) {
-              setToastMessage({
-                text: '⚡ وصل طلب توصيل جديد في نطاقك الجغرافي!',
-                type: 'info',
-              });
-              try {
-                const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-                const osc = audioCtx.createOscillator();
-                const gain = audioCtx.createGain();
-                osc.connect(gain);
-                gain.connect(audioCtx.destination);
-                osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // D5
-                osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.15); // A5
-                gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
-                osc.start(audioCtx.currentTime);
-                osc.stop(audioCtx.currentTime + 0.4);
-              } catch {
-                // Audio not supported or blocked by user gesture
-              }
-            }
-            setDeliveryLastEventTime(
-              new Date().toLocaleTimeString('ar-EG', {
-                hour12: false,
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              })
-            );
-          } catch (e) {
-            console.warn('Realtime order update error:', e);
-          }
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'delivery_order_items' },
-        () => {
-          if (!isMounted) return;
-          if (deliveryRefetchTimerRef.current) {
-            clearTimeout(deliveryRefetchTimerRef.current);
-          }
-          deliveryRefetchTimerRef.current = setTimeout(async () => {
-            if (isDeliverySyncingRef.current) {
-              pendingDeliverySyncRef.current = true;
-              return;
-            }
-            await syncWithSupabase();
-          }, 250);
-        }
-      )
-      .subscribe((status, err) => {
-        if (!isMounted) return;
-        setDeliveryRealtimeStatus(status as RealtimeConnectionStatus);
-        setIsRealtimeConnected(status === 'SUBSCRIBED');
-        if (err?.message) {
-          setDeliveryRealtimeError(err.message);
-        } else {
-          setDeliveryRealtimeError(null);
-        }
-        if (status === 'SUBSCRIBED') {
-          void syncWithSupabase();
-        }
-      });
+    const unsubOrders = ordersService.subscribe(() => {
+      if (!isMounted) return;
+      void syncWithSupabase();
+      setIsRealtimeConnected(true);
+      setDeliveryRealtimeStatus('SUBSCRIBED');
+      setDeliveryLastEventTime(
+        new Date().toLocaleTimeString('ar-EG', {
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
+      );
+    });
 
     // Realtime subscription for central driver assets (driver/header & driver/splash)
     const assetsChannel = supabase
@@ -873,14 +749,21 @@ export default function App() {
 
     return () => {
       isMounted = false;
-      if (deliveryRefetchTimerRef.current) {
-        clearTimeout(deliveryRefetchTimerRef.current);
-      }
       authListener.subscription.unsubscribe();
-      supabase.removeChannel(ordersChannel);
       supabase.removeChannel(assetsChannel);
+      unsubOrders();
     };
   }, []);
+
+  // Sync driver session with ordersService
+  useEffect(() => {
+    if (currentDriver?.id) {
+      ordersService.setDriverSession(currentDriver.id, {
+        governorate: currentDriver.governorate_name || (currentDriver as any).governorate,
+        center: currentDriver.markaz_name || (currentDriver as any).center,
+      });
+    }
+  }, [currentDriver]);
 
   // Online / Offline & Offline Action Queue Synchronization
   const triggerOfflineQueueSync = useCallback(async () => {
