@@ -69,6 +69,8 @@ import {
   isOrderMatchingDriverTerritory,
 } from './data/locationOrderMatcher';
 import { usePharmacy } from './hooks/usePharmacy';
+import { useDriverAuth } from './hooks/useDriverAuth';
+import type { DeliveryDriver, DriverStatus, DriverAppState } from './types';
 import { ordersService } from './services/ordersService';
 import { PharmacyOrdersSection } from './components/pharmacy/PharmacyOrdersSection';
 import { PharmacyRealtimeDiagnosticModal } from './components/pharmacy/PharmacyRealtimeDiagnosticModal';
@@ -117,34 +119,7 @@ export const getSafeNumericQty = (qty: string | number | undefined | null): numb
 // 1. Types strictly mapped to Database Schema JSON
 // ============================================================================
 
-export type DriverStatus = 'pending_approval' | 'approved' | 'rejected';
-
-export interface DeliveryDriver {
-  id: string;
-  user_id: string | null;
-  full_name: string;
-  phone: string;
-  is_active: boolean;
-  vehicle_type: string | null;
-  notes: string | null;
-  created_at: string;
-  updated_at: string;
-  status: DriverStatus;
-  governorate_name: string | null;
-  governorate_code: string | null;
-  markaz_name: string | null;
-  vehicle_plate: string | null;
-  national_id: string | null;
-  approved_at: string | null;
-  approved_by: string | null;
-  rejected_at: string | null;
-  rejected_by: string | null;
-  rejection_reason: string | null;
-  id_card_front_path?: string | null;
-  id_card_back_path?: string | null;
-  driver_license_path?: string | null;
-  vehicle_license_path?: string | null;
-}
+export type { DriverStatus, DeliveryDriver } from './types';
 
 export interface DeliverySettings {
   id: string;
@@ -305,22 +280,36 @@ function callCustomer(phoneNumber?: string | null): void {
 // ============================================================================
 
 export default function App() {
-  // Splash Screen State & Central Assets State (Synchronous Local Cache on Startup)
-  const [isSplashActive, setIsSplashActive] = useState(true);
-  const [splashMessage, setSplashMessage] = useState('جاري التحقق من هوية السائق وبيانات الحساب...');
-  const [splashStep, setSplashStep] = useState(1);
+  // Authoritative Driver Authentication and Profile Hook
+  const {
+    supabaseUser,
+    currentDriver,
+    authStatus,
+    authError: driverAuthError,
+    isAuthSubmitting,
+    isSyncingDriver,
+    splashMessage,
+    splashStep,
+    loginWithEmail,
+    logout: driverLogout,
+    checkDriverStatus,
+    saveDriverProfile,
+    setDriverAfterRegistration,
+    clearAuthError,
+    retryFetchDriver,
+  } = useDriverAuth();
+
   const [splashImageSrc] = useState<string>(() => getInitialSplashAssetSrc());
   const [headerImageSrc, setHeaderImageSrc] = useState<string>(() => getInitialHeaderAssetSrc());
 
-  // Authentication & Session State
-  const [supabaseUser, setSupabaseUser] = useState<any>(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  // Authentication & Registration Form State
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [showSupabaseSettings, setShowSupabaseSettings] = useState(false);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
-  const [authSubmitting, setAuthSubmitting] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const [localAuthError, setLocalAuthError] = useState<string | null>(null);
+  const [registrationSubmitting, setRegistrationSubmitting] = useState(false);
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
 
   // Delivery Driver Registration Specific Fields
   const [regFullName, setRegFullName] = useState('');
@@ -345,10 +334,8 @@ export default function App() {
   }, [regGovernorateName]);
 
   // Primary Live States - Strictly Real Database Data
-  const [currentDriver, setCurrentDriver] = useState<DeliveryDriver | null>(null);
   const currentDriverRef = useRef<DeliveryDriver | null>(null);
   currentDriverRef.current = currentDriver;
-  const [driverNotFoundInTable, setDriverNotFoundInTable] = useState(false);
   const [settings, setSettings] = useState<DeliverySettings>(DEFAULT_DELIVERY_SETTINGS);
   const [governorates, setGovernorates] = useState<DeliveryGovernorateSetting[]>([]);
   const [orders, setOrders] = useState<DeliveryOrder[]>([]);
@@ -467,15 +454,32 @@ export default function App() {
     });
   };
 
-  // Helper to resolve real document image: from DB Base64 Data URL, or device cache
+  // Helper to resolve real document image: from Storage public URL, direct URL, or device preview cache
   const resolveDocImage = (
     dbPath?: string | null,
     docType?: 'idCardFront' | 'idCardBack' | 'driverLicense' | 'vehicleLicense',
     userId?: string
   ): string | null => {
-    if (dbPath && (dbPath.startsWith('data:image/') || dbPath.startsWith('http://') || dbPath.startsWith('https://'))) {
+    // 1. Direct web URL or legacy data URL
+    if (dbPath && (dbPath.startsWith('http://') || dbPath.startsWith('https://') || dbPath.startsWith('data:image/'))) {
       return dbPath;
     }
+
+    // 2. Storage path in driver-documents bucket
+    if (dbPath && typeof dbPath === 'string') {
+      const supabase = getClient();
+      if (supabase) {
+        try {
+          const cleanPath = dbPath.replace(/^driver-documents\//, '');
+          const { data } = supabase.storage.from('driver-documents').getPublicUrl(cleanPath);
+          if (data?.publicUrl) return data.publicUrl;
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // 3. Fallback to local device preview cache
     if (userId) {
       try {
         const cached = localStorage.getItem(`driver_docs_${userId}`);
@@ -527,30 +531,14 @@ export default function App() {
         setGovernorates(gData as DeliveryGovernorateSetting[]);
       }
 
-      // 3. Fetch authenticated delivery_driver profile from Supabase delivery_drivers table
-      const effectiveUserId = userId || supabaseUser?.id;
-      if (effectiveUserId) {
-        const { data: myDriver, error: myErr } = await supabase
-          .from('delivery_drivers')
-          .select('*')
-          .eq('user_id', effectiveUserId)
-          .maybeSingle();
-
-        if (!myErr && myDriver) {
-          const activeDriver = myDriver as DeliveryDriver;
-          setCurrentDriver(activeDriver);
-          currentDriverRef.current = activeDriver;
-          setDriverNotFoundInTable(false);
-        } else {
-          setCurrentDriver(null);
-          currentDriverRef.current = null;
-          setDriverNotFoundInTable(true);
-        }
+      // 3. Fetch delivery_orders only if authenticated driver is approved and active
+      const activeDriver = currentDriverRef.current;
+      if (!activeDriver || activeDriver.status !== 'approved' || !activeDriver.is_active) {
+        setOrders([]);
+        return;
       }
 
-      // 4. Fetch delivery_orders & delivery_order_items (from reference talabat-al-bayt-driver)
-      const activeDriver = currentDriverRef.current;
-      const driverId = activeDriver?.id ? String(activeDriver.id) : null;
+      const driverId = activeDriver.id ? String(activeDriver.id) : null;
       const governorate = (activeDriver?.governorate_name || (activeDriver as any)?.governorate || '').trim();
       const center = (activeDriver?.markaz_name || (activeDriver as any)?.center || '').trim();
 
@@ -639,78 +627,27 @@ export default function App() {
     } finally {
       setIsSyncing(false);
     }
-  }, [supabaseUser?.id]);
+  }, []);
 
-  // Check Supabase Auth Session on Mount & Bootstrap Splash Screen
+  // Synchronize orders when driver becomes approved and active
+  useEffect(() => {
+    if (authStatus === 'approved_active') {
+      void syncWithSupabase();
+    } else {
+      setOrders([]);
+    }
+  }, [authStatus, syncWithSupabase]);
+
+  // Setup Realtime and central assets sync
   useEffect(() => {
     const supabase = getClient();
-    if (!supabase) {
-      setIsSplashActive(false);
-      setAuthLoading(false);
-      return;
-    }
+    if (!supabase) return;
 
     let isMounted = true;
-
-    async function initSession() {
-      setSplashMessage('التحقق من جلسة المستخدم...');
-      setSplashStep(1);
-
-      try {
-        const { data: { session } } = await supabase!.auth.getSession();
-        if (!isMounted) return;
-
-        if (session?.user) {
-          setSupabaseUser(session.user);
-          setSplashMessage('جلب بيانات السائق وفحص الاعتماد الإداري...');
-          setSplashStep(2);
-          await syncWithSupabase(session.user.id);
-          if (!isMounted) return;
-
-          setSplashMessage('تحميل بيانات التطبيق وقائمة الطلبات...');
-          setSplashStep(3);
-          setTimeout(() => {
-            if (isMounted) {
-              setIsSplashActive(false);
-              setAuthLoading(false);
-            }
-          }, 450);
-        } else {
-          if (isMounted) {
-            setIsSplashActive(false);
-            setAuthLoading(false);
-          }
-        }
-      } catch (err) {
-        console.warn('Init session error:', err);
-        if (isMounted) {
-          setIsSplashActive(false);
-          setAuthLoading(false);
-        }
-      }
-    }
-
-    initSession();
 
     // Non-blocking background check for central assets on startup
     void syncAllDriverCentralAssets(supabase, (newHeaderSrc) => {
       if (isMounted) setHeaderImageSrc(newHeaderSrc);
-    });
-
-    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (!isMounted) return;
-      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
-        void syncAllDriverCentralAssets(supabase, (newHeaderSrc) => {
-          if (isMounted) setHeaderImageSrc(newHeaderSrc);
-        });
-      }
-      if (event === 'SIGNED_OUT') {
-        setSupabaseUser(null);
-        setCurrentDriver(null);
-        setDriverNotFoundInTable(false);
-        setIsSplashActive(false);
-        setAuthLoading(false);
-      }
     });
 
     // Authoritative Realtime & Auto-Sync (from reference talabat-al-bayt-driver)
@@ -719,7 +656,9 @@ export default function App() {
 
     const unsubOrders = ordersService.subscribe(() => {
       if (!isMounted) return;
-      void syncWithSupabase();
+      if (authStatus === 'approved_active') {
+        void syncWithSupabase();
+      }
       setIsRealtimeConnected(true);
       setDeliveryRealtimeStatus('SUBSCRIBED');
       setDeliveryLastEventTime(
@@ -749,11 +688,10 @@ export default function App() {
 
     return () => {
       isMounted = false;
-      authListener.subscription.unsubscribe();
       supabase.removeChannel(assetsChannel);
       unsubOrders();
     };
-  }, []);
+  }, [authStatus, syncWithSupabase]);
 
   // Sync driver session with ordersService
   useEffect(() => {
@@ -823,364 +761,291 @@ export default function App() {
   }, [currentDriver, triggerOfflineQueueSync, syncWithSupabase, showToast]);
 
   // Handle Driver Authentication (Login / Register)
+  // Handle Driver Authentication (Login / Register)
   // CRITICAL RULE: Stage 1 creates delivery_driver record only. No Household, no profiles.
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setAuthError(null);
-    setAuthSubmitting(true);
+    setLocalAuthError(null);
+    clearAuthError();
 
+    if (authMode === 'login') {
+      const res = await loginWithEmail(authEmail, authPassword);
+      if (!res.success) {
+        setLocalAuthError(res.error || 'فشل تسجيل الدخول. يرجى التحقق من صحة البريد وكلمة المرور.');
+        return;
+      }
+      showToast('تم تسجيل الدخول بنجاح.', 'success');
+      return;
+    }
+
+    // Register Mode Validations
+    setRegistrationSubmitting(true);
     const supabase = getClient();
     if (!supabase) {
-      setAuthError('يرجى ضبط رابط ومشروع Supabase أولاً من تبويب الإعدادات.');
-      setAuthSubmitting(false);
+      setLocalAuthError('يرجى ضبط رابط ومشروع Supabase أولاً من تبويب الإعدادات.');
+      setRegistrationSubmitting(false);
       return;
     }
 
     try {
-      if (authMode === 'login') {
-        // Activate Splash Screen for smooth background verification without flicker
-        setIsSplashActive(true);
-        setSplashMessage('التحقق من صحة بيانات الدخول...');
-        setSplashStep(1);
+      if (!regFullName.trim()) {
+        throw new Error('الاسم الرباعي الكامل للسائق مطلوب وإلزامي.');
+      }
+      if (!regPhone.trim()) {
+        throw new Error('رقم هاتف السائق مطلوب وإلزامي.');
+      }
+      if (!regGovernorateName.trim()) {
+        throw new Error('يرجى اختيار المحافظة التابع لها.');
+      }
+      if (!regMarkazName.trim()) {
+        throw new Error('يرجى اختيار المركز أو المدينة.');
+      }
+      if (!regDetailedAddress.trim()) {
+        throw new Error('العنوان التفصيلي (الشارع / القرية) مطلوب وإلزامي.');
+      }
+      if (!idCardFront || !idCardFront.file) {
+        throw new Error('يرجى التقاط أو رفع صورة بطاقة الهوية الشخصية (الوجه الأمامي).');
+      }
+      if (!idCardBack || !idCardBack.file) {
+        throw new Error('يرجى التقاط أو رفع صورة بطاقة الهوية الشخصية (الظهر).');
+      }
+      if (!driverLicense || !driverLicense.file) {
+        throw new Error('يرجى التقاط أو رفع صورة رخصة القيادة الشخصية.');
+      }
+      if (!vehicleLicense || !vehicleLicense.file) {
+        throw new Error('يرجى التقاط أو رفع صورة رخصة تسيير المركبة.');
+      }
 
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: authEmail.trim(),
-          password: authPassword,
-        });
+      // Validate raw image size (up to 25MB to accept high-res camera photos before canvas WebP compression)
+      const MAX_DOC_BYTES = 25 * 1024 * 1024;
+      if (idCardFront.file.size > MAX_DOC_BYTES) {
+        throw new Error('حجم صورة بطاقة الهوية (الوجه الأمامي) كبير جداً (يتجاوز 25 ميجابايت).');
+      }
+      if (idCardBack.file.size > MAX_DOC_BYTES) {
+        throw new Error('حجم صورة بطاقة الهوية (الظهر) كبير جداً (يتجاوز 25 ميجابايت).');
+      }
+      if (driverLicense.file.size > MAX_DOC_BYTES) {
+        throw new Error('حجم صورة رخصة القيادة كبير جداً (يتجاوز 25 ميجابايت).');
+      }
+      if (vehicleLicense.file.size > MAX_DOC_BYTES) {
+        throw new Error('حجم صورة رخصة تسيير المركبة كبير جداً (يتجاوز 25 ميجابايت).');
+      }
 
-        if (error) {
-          setIsSplashActive(false);
-          throw error;
-        }
+      // Process & compress all 4 documents into high-clarity, compact binary WebP blobs
+      const frontProcessed = idCardFront.dataUrl
+        ? { dataUrl: idCardFront.dataUrl, blob: dataUrlToBlob(idCardFront.dataUrl) }
+        : await processDocumentImage(idCardFront.file, 1200, 0.8);
 
-        if (data.user) {
-          setSupabaseUser(data.user);
-          setSplashMessage('جلب بيانات السائق وفحص الاعتماد الإداري...');
-          setSplashStep(2);
-          await syncWithSupabase(data.user.id);
-          setSplashStep(3);
-          setTimeout(() => {
-            setIsSplashActive(false);
-            showToast('تم تسجيل الدخول بنجاح.');
-          }, 400);
-        }
-      } else {
-        // Register Mode Validations
-        if (!regFullName.trim()) {
-          throw new Error('الاسم الرباعي الكامل للسائق مطلوب وإلزامي.');
-        }
-        if (!regPhone.trim()) {
-          throw new Error('رقم هاتف السائق مطلوب وإلزامي.');
-        }
-        if (!regGovernorateName.trim()) {
-          throw new Error('يرجى اختيار المحافظة التابع لها.');
-        }
-        if (!regMarkazName.trim()) {
-          throw new Error('يرجى اختيار المركز أو المدينة.');
-        }
-        if (!regDetailedAddress.trim()) {
-          throw new Error('العنوان التفصيلي (الشارع / القرية) مطلوب وإلزامي.');
-        }
-        if (!idCardFront || !idCardFront.file) {
-          throw new Error('يرجى التقاط أو رفع صورة بطاقة الهوية الشخصية (الوجه الأمامي).');
-        }
-        if (!idCardBack || !idCardBack.file) {
-          throw new Error('يرجى التقاط أو رفع صورة بطاقة الهوية الشخصية (الظهر).');
-        }
-        if (!driverLicense || !driverLicense.file) {
-          throw new Error('يرجى التقاط أو رفع صورة رخصة القيادة الشخصية.');
-        }
-        if (!vehicleLicense || !vehicleLicense.file) {
-          throw new Error('يرجى التقاط أو رفع صورة رخصة تسيير المركبة.');
-        }
+      const backProcessed = idCardBack.dataUrl
+        ? { dataUrl: idCardBack.dataUrl, blob: dataUrlToBlob(idCardBack.dataUrl) }
+        : await processDocumentImage(idCardBack.file, 1200, 0.8);
 
-        // Validate raw image size (up to 25MB to accept high-res camera photos before canvas WebP compression)
-        const MAX_DOC_BYTES = 25 * 1024 * 1024;
-        if (idCardFront.file.size > MAX_DOC_BYTES) {
-          throw new Error('حجم صورة بطاقة الهوية (الوجه الأمامي) كبير جداً (يتجاوز 25 ميجابايت).');
-        }
-        if (idCardBack.file.size > MAX_DOC_BYTES) {
-          throw new Error('حجم صورة بطاقة الهوية (الظهر) كبير جداً (يتجاوز 25 ميجابايت).');
-        }
-        if (driverLicense.file.size > MAX_DOC_BYTES) {
-          throw new Error('حجم صورة رخصة القيادة كبير جداً (يتجاوز 25 ميجابايت).');
-        }
-        if (vehicleLicense.file.size > MAX_DOC_BYTES) {
-          throw new Error('حجم صورة رخصة تسيير المركبة كبير جداً (يتجاوز 25 ميجابايت).');
-        }
+      const driverLicenseProcessed = driverLicense.dataUrl
+        ? { dataUrl: driverLicense.dataUrl, blob: dataUrlToBlob(driverLicense.dataUrl) }
+        : await processDocumentImage(driverLicense.file, 1200, 0.8);
 
-        // Process & compress all 4 documents into high-clarity, compact Base64 Data URLs (guaranteed for PostgreSQL database storage)
-        const frontProcessed = idCardFront.dataUrl
-          ? { dataUrl: idCardFront.dataUrl, blob: dataUrlToBlob(idCardFront.dataUrl) }
-          : await processDocumentImage(idCardFront.file, 1200, 0.8);
+      const vehicleLicenseProcessed = vehicleLicense.dataUrl
+        ? { dataUrl: vehicleLicense.dataUrl, blob: dataUrlToBlob(vehicleLicense.dataUrl) }
+        : await processDocumentImage(vehicleLicense.file, 1200, 0.8);
 
-        const backProcessed = idCardBack.dataUrl
-          ? { dataUrl: idCardBack.dataUrl, blob: dataUrlToBlob(idCardBack.dataUrl) }
-          : await processDocumentImage(idCardBack.file, 1200, 0.8);
-
-        const driverLicenseProcessed = driverLicense.dataUrl
-          ? { dataUrl: driverLicense.dataUrl, blob: dataUrlToBlob(driverLicense.dataUrl) }
-          : await processDocumentImage(driverLicense.file, 1200, 0.8);
-
-        const vehicleLicenseProcessed = vehicleLicense.dataUrl
-          ? { dataUrl: vehicleLicense.dataUrl, blob: dataUrlToBlob(vehicleLicense.dataUrl) }
-          : await processDocumentImage(vehicleLicense.file, 1200, 0.8);
-
-        // 1. Create Supabase Auth User with metadata indicating delivery_driver role
-        const { data: authData, error: signUpErr } = await supabase.auth.signUp({
-          email: authEmail.trim(),
-          password: authPassword,
-          options: {
-            data: {
-              role: 'delivery_driver',
-              user_type: 'delivery_driver',
-              full_name: regFullName.trim(),
-              phone: regPhone.trim(),
-            },
+      // 1. Create Supabase Auth User with metadata indicating delivery_driver role
+      const { data: authData, error: signUpErr } = await supabase.auth.signUp({
+        email: authEmail.trim(),
+        password: authPassword,
+        options: {
+          data: {
+            role: 'delivery_driver',
+            user_type: 'delivery_driver',
+            full_name: regFullName.trim(),
+            phone: regPhone.trim(),
           },
+        },
+      });
+
+      if (signUpErr) {
+        throw new Error(`تعذر إنشاء حساب السائق: ${signUpErr.message}`);
+      }
+
+      const newUser = authData.user;
+      if (!newUser) {
+        throw new Error('تعذر إنشاء حساب السائق. يرجى التحقق من صحة البريد الإلكتروني وكلمة المرور.');
+      }
+
+      // Determine authenticated session & user ID
+      let activeUserId: string;
+      let finalUser: any = newUser;
+
+      if (authData.session && authData.session.user?.id) {
+        activeUserId = authData.session.user.id;
+        finalUser = authData.session.user;
+      } else {
+        const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({
+          email: authEmail.trim(),
+          password: authPassword,
         });
 
-        if (signUpErr) {
-          throw new Error(`تعذر إنشاء حساب السائق: ${signUpErr.message}`);
-        }
-
-        const newUser = authData.user;
-        if (!newUser) {
-          throw new Error('تعذر إنشاء حساب السائق. يرجى التحقق من صحة البريد الإلكتروني وكلمة المرور.');
-        }
-
-        // Determine authenticated session & user ID
-        let activeUserId: string;
-        let finalUser: any = newUser;
-
-        if (authData.session && authData.session.user?.id) {
-          // Case 1: Active session already returned by signUp
-          activeUserId = authData.session.user.id;
-          finalUser = authData.session.user;
-          console.log('[DRIVER REGISTER] Active session obtained from signUp. User ID:', activeUserId);
-        } else {
-          // Case 2: authData.session is null -> Establish session via signInWithPassword
-          console.log('[DRIVER REGISTER] authData.session is null. Initiating signInWithPassword to obtain authenticated session...');
-          const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({
-            email: authEmail.trim(),
-            password: authPassword,
-          });
-
-          if (signInErr) {
-            console.error('[DRIVER REGISTER] signInWithPassword failed after signUp:', signInErr);
-            throw new Error(
-              `تم إنشاء حساب المستخدم في auth.users ولكن تعذر تفعيل جلسة المصادقة تلقائيًا: ${signInErr.message}. ` +
-              `إذا كان خيار تأكيد البريد مفعّلاً في Supabase، يرجى تأكيد البريد ثم تسجيل الدخول.`
-            );
-          }
-
-          if (!signInData.session || !signInData.session.user?.id) {
-            console.error('[DRIVER REGISTER] No session or user id returned from signInWithPassword');
-            throw new Error(
-              'تم إنشاء الحساب ولكن تعذر إنشاء جلسة مصادقة صالحة. يرجى المحاولة مرة أخرى عبر تسجيل الدخول.'
-            );
-          }
-
-          activeUserId = signInData.session.user.id;
-          finalUser = signInData.session.user;
-          console.log('[DRIVER REGISTER] Authenticated session established via signInWithPassword. Session User ID:', activeUserId);
-        }
-
-        // Storage paths for the 4 documents
-        const bucketName = 'driver-documents';
-        const docBasePath = `drivers/${activeUserId}/documents`;
-        const frontDocPath = `${docBasePath}/id_card_front.webp`;
-        const backDocPath = `${docBasePath}/id_card_back.webp`;
-        const driverLicenseDocPath = `${docBasePath}/driver_license.webp`;
-        const vehicleLicenseDocPath = `${docBasePath}/vehicle_license.webp`;
-
-        // Extract native binary blobs from the processed document results
-        const frontBlob = frontProcessed.blob;
-        const backBlob = backProcessed.blob;
-        const driverLicenseBlob = driverLicenseProcessed.blob;
-        const vehicleLicenseBlob = vehicleLicenseProcessed.blob;
-
-        // Wrap WebP/JPEG blobs into standard File objects for robust multi-platform upload
-        const frontFile = new File([frontBlob], 'id_card_front.webp', { type: 'image/webp' });
-        const backFile = new File([backBlob], 'id_card_back.webp', { type: 'image/webp' });
-        const driverLicenseFile = new File([driverLicenseBlob], 'driver_license.webp', { type: 'image/webp' });
-        const vehicleLicenseFile = new File([vehicleLicenseBlob], 'vehicle_license.webp', { type: 'image/webp' });
-
-        // Track uploaded paths for cleanup if any subsequent step fails
-        const uploadedPaths: string[] = [];
-
-        const rollbackUploadedFiles = async () => {
-          if (uploadedPaths.length > 0) {
-            try {
-              console.warn('[DRIVER REGISTER] Rolling back uploaded storage files:', uploadedPaths);
-              await supabase.storage.from(bucketName).remove(uploadedPaths);
-            } catch (cleanupErr) {
-              console.warn('[DRIVER REGISTER] Rollback cleanup error:', cleanupErr);
-            }
-          }
-        };
-
-        // 2. Resilient Document Upload to Supabase Storage
-        // Attempts storage upload if bucket is provisioned; if storage is unavailable or bucket not yet created,
-        // it gracefully retains the canonical document paths in delivery_drivers without throwing or blocking registration.
-        const uploadDocSafely = async (
-          docPath: string,
-          file: File,
-          label: string
-        ): Promise<{ success: boolean; path: string }> => {
-          try {
-            const { error: upErr } = await supabase.storage
-              .from(bucketName)
-              .upload(docPath, file, {
-                contentType: 'image/webp',
-                upsert: true,
-              });
-
-            if (upErr) {
-              console.warn(
-                `[DRIVER REGISTER] ${label} storage upload skipped (${upErr.message || 'Bucket not found / RLS'}). Document reference preserved.`
-              );
-              return { success: false, path: docPath };
-            }
-            uploadedPaths.push(docPath);
-            return { success: true, path: docPath };
-          } catch (storageErr: any) {
-            console.warn(
-              `[DRIVER REGISTER] ${label} storage service unreachable (${storageErr?.message || 'Storage unavailable'}). Document reference preserved.`
-            );
-            return { success: false, path: docPath };
-          }
-        };
-
-        // Upload documents concurrently with non-blocking error tolerance
-        await Promise.all([
-          uploadDocSafely(frontDocPath, frontFile, 'Front ID'),
-          uploadDocSafely(backDocPath, backFile, 'Back ID'),
-          uploadDocSafely(driverLicenseDocPath, driverLicenseFile, 'Driver License'),
-          uploadDocSafely(vehicleLicenseDocPath, vehicleLicenseFile, 'Vehicle License'),
-        ]);
-
-        // Cache document previews locally for instant visual confirmation on this device
-        try {
-          const docPreviews = {
-            idCardFront: frontProcessed.dataUrl || idCardFront.previewUrl,
-            idCardBack: backProcessed.dataUrl || idCardBack.previewUrl,
-            driverLicense: driverLicenseProcessed.dataUrl || driverLicense.previewUrl,
-            vehicleLicense: vehicleLicenseProcessed.dataUrl || vehicleLicense.previewUrl,
-            timestamp: Date.now(),
-          };
-          localStorage.setItem(`driver_docs_${activeUserId}`, JSON.stringify(docPreviews));
-        } catch {
-          // Ignore local storage quota limits
-        }
-
-        // Lookup governorate code
-        const matchedGov = EGYPT_GOVERNORATES.find((g) => g.name === regGovernorateName.trim());
-        const matchedGovCode = matchedGov ? matchedGov.code : null;
-
-        // 6. Insert record into delivery_drivers with verified Base64 data URLs ensuring documents are 100% saved in Postgres
-        const driverRecord = {
-          user_id: activeUserId,
-          full_name: regFullName.trim(),
-          phone: regPhone.trim(),
-          national_id: 'مرفق بالوثائق',
-          governorate_name: regGovernorateName.trim() || null,
-          governorate_code: matchedGovCode,
-          markaz_name: regMarkazName.trim() || null,
-          vehicle_type: regVehicleType.trim() || null,
-          vehicle_plate: 'مرفق بالرخصة',
-          notes: `[الدولة: مصر] [العنوان التفصيلي: ${regDetailedAddress.trim()}] ${regNotes.trim() ? `[ملاحظات: ${regNotes.trim()}]` : ''} [الوثائق المرفوعة: بطاقة وجه + ظهر، رخصة قيادة، رخصة مركبة] [مسارات الوثائق: بطاقة أمامي=${frontDocPath} | بطاقة ظهر=${backDocPath} | رخصة قيادة=${driverLicenseDocPath} | رخصة مركبة=${vehicleLicenseDocPath}]`.trim(),
-          status: 'pending_approval' as DriverStatus,
-          is_active: false,
-          id_card_front_path: frontProcessed.dataUrl || frontDocPath,
-          id_card_back_path: backProcessed.dataUrl || backDocPath,
-          driver_license_path: driverLicenseProcessed.dataUrl || driverLicenseDocPath,
-          vehicle_license_path: vehicleLicenseProcessed.dataUrl || vehicleLicenseDocPath,
-        };
-
-        console.log('[DRIVER REGISTER] Attempting INSERT into delivery_drivers with driverRecord:', driverRecord);
-
-        // Insert directly into delivery_drivers under the authenticated session
-        const { data: inserted, error: tableErr } = await supabase
-          .from('delivery_drivers')
-          .insert(driverRecord)
-          .select()
-          .single();
-
-        if (tableErr) {
-          console.error('[DRIVER REGISTER] INSERT Error:', {
-            code: tableErr.code,
-            message: tableErr.message,
-            details: tableErr.details,
-            hint: tableErr.hint,
-            userId: activeUserId,
-          });
-
-          // Rollback uploaded files to prevent orphaned files in storage
-          await rollbackUploadedFiles();
-
-          if (tableErr.code === '42501' && tableErr.message?.includes('permission denied')) {
-            throw new Error(
-              `تم رفع الوثائق ولكن تعذر حفظ بيانات السائق بسبب صلاحيات قاعدة البيانات (42501): ينقص دور المستخدم المصادق عليه (authenticated) تصريح الإدراج في جدول delivery_drivers.`
-            );
-          }
-
+        if (signInErr) {
           throw new Error(
-            `تم رفع الوثائق ولكن تعذر حفظ بيانات السائق في قاعدة البيانات: ${tableErr.message}`
+            `تم إنشاء حساب المستخدم في auth.users ولكن تعذر تفعيل جلسة المصادقة تلقائيًا: ${signInErr.message}. ` +
+            `إذا كان خيار تأكيد البريد مفعّلاً في Supabase، يرجى تأكيد البريد ثم تسجيل الدخول.`
           );
         }
 
-        if (inserted) {
-          setCurrentDriver(inserted as DeliveryDriver);
-          setDriverNotFoundInTable(false);
+        if (!signInData.session || !signInData.session.user?.id) {
+          throw new Error(
+            'تم إنشاء الحساب ولكن تعذر إنشاء جلسة مصادقة صالحة. يرجى المحاولة مرة أخرى عبر تسجيل الدخول.'
+          );
         }
 
-        setSupabaseUser(finalUser);
-        showToast('تم تقديم طلب تسجيل السائق ورفع الوثائق بنجاح! بياناتك قيد مراجعة الإدارة.', 'success');
-        await syncWithSupabase(activeUserId);
+        activeUserId = signInData.session.user.id;
+        finalUser = signInData.session.user;
       }
+
+      // Storage paths for the 4 documents in driver-documents bucket
+      const bucketName = 'driver-documents';
+      const docBasePath = `drivers/${activeUserId}/documents`;
+      const frontDocPath = `${docBasePath}/id_card_front.webp`;
+      const backDocPath = `${docBasePath}/id_card_back.webp`;
+      const driverLicenseDocPath = `${docBasePath}/driver_license.webp`;
+      const vehicleLicenseDocPath = `${docBasePath}/vehicle_license.webp`;
+
+      const frontBlob = frontProcessed.blob;
+      const backBlob = backProcessed.blob;
+      const driverLicenseBlob = driverLicenseProcessed.blob;
+      const vehicleLicenseBlob = vehicleLicenseProcessed.blob;
+
+      const frontFile = new File([frontBlob], 'id_card_front.webp', { type: 'image/webp' });
+      const backFile = new File([backBlob], 'id_card_back.webp', { type: 'image/webp' });
+      const driverLicenseFile = new File([driverLicenseBlob], 'driver_license.webp', { type: 'image/webp' });
+      const vehicleLicenseFile = new File([vehicleLicenseBlob], 'vehicle_license.webp', { type: 'image/webp' });
+
+      const uploadedPaths: string[] = [];
+
+      const rollbackUploadedFiles = async () => {
+        if (uploadedPaths.length > 0) {
+          try {
+            await supabase.storage.from(bucketName).remove(uploadedPaths);
+          } catch (cleanupErr) {
+            console.warn('[DRIVER REGISTER] Rollback cleanup error:', cleanupErr);
+          }
+        }
+      };
+
+      const uploadDocSafely = async (
+        docPath: string,
+        file: File,
+        label: string
+      ): Promise<{ success: boolean; path: string }> => {
+        try {
+          const { error: upErr } = await supabase.storage
+            .from(bucketName)
+            .upload(docPath, file, {
+              contentType: 'image/webp',
+              upsert: true,
+            });
+
+          if (upErr) {
+            console.warn(`[DRIVER REGISTER] ${label} storage upload note (${upErr.message})`);
+            return { success: false, path: docPath };
+          }
+          uploadedPaths.push(docPath);
+          return { success: true, path: docPath };
+        } catch (storageErr: any) {
+          console.warn(`[DRIVER REGISTER] ${label} storage service note (${storageErr?.message})`);
+          return { success: false, path: docPath };
+        }
+      };
+
+      await Promise.all([
+        uploadDocSafely(frontDocPath, frontFile, 'Front ID'),
+        uploadDocSafely(backDocPath, backFile, 'Back ID'),
+        uploadDocSafely(driverLicenseDocPath, driverLicenseFile, 'Driver License'),
+        uploadDocSafely(vehicleLicenseDocPath, vehicleLicenseFile, 'Vehicle License'),
+      ]);
+
+      // Cache document previews locally for fast preview on this client device
+      try {
+        const docPreviews = {
+          idCardFront: frontProcessed.dataUrl || idCardFront.previewUrl,
+          idCardBack: backProcessed.dataUrl || idCardBack.previewUrl,
+          driverLicense: driverLicenseProcessed.dataUrl || driverLicense.previewUrl,
+          vehicleLicense: vehicleLicenseProcessed.dataUrl || vehicleLicense.previewUrl,
+          timestamp: Date.now(),
+        };
+        localStorage.setItem(`driver_docs_${activeUserId}`, JSON.stringify(docPreviews));
+      } catch {
+        // Ignore local storage quota limits
+      }
+
+      // Lookup governorate code
+      const matchedGov = EGYPT_GOVERNORATES.find((g) => g.name === regGovernorateName.trim());
+      const matchedGovCode = matchedGov ? matchedGov.code : null;
+
+      // Note: Store only clean storage path strings in the Postgres text columns, NOT Base64!
+      const driverRecord = {
+        user_id: activeUserId,
+        full_name: regFullName.trim(),
+        phone: regPhone.trim(),
+        national_id: 'مرفق بالوثائق',
+        governorate_name: regGovernorateName.trim() || null,
+        governorate_code: matchedGovCode,
+        markaz_name: regMarkazName.trim() || null,
+        vehicle_type: regVehicleType.trim() || null,
+        vehicle_plate: 'مرفق بالرخصة',
+        notes: `[الدولة: مصر] [العنوان التفصيلي: ${regDetailedAddress.trim()}] ${regNotes.trim() ? `[ملاحظات: ${regNotes.trim()}]` : ''}`.trim(),
+        status: 'pending_approval' as DriverStatus,
+        is_active: false,
+        id_card_front_path: frontDocPath,
+        id_card_back_path: backDocPath,
+        driver_license_path: driverLicenseDocPath,
+        vehicle_license_path: vehicleLicenseDocPath,
+      };
+
+      const { data: inserted, error: tableErr } = await supabase
+        .from('delivery_drivers')
+        .insert(driverRecord)
+        .select()
+        .single();
+
+      if (tableErr) {
+        await rollbackUploadedFiles();
+        if (tableErr.code === '42501' && tableErr.message?.includes('permission denied')) {
+          throw new Error(
+            'تعذر حفظ بيانات السائق بسبب الصلاحيات (42501): ينقص دور authenticated تصريح الإدراج في جدول delivery_drivers.'
+          );
+        }
+        throw new Error(`تعذر حفظ بيانات السائق في قاعدة البيانات: ${tableErr.message}`);
+      }
+
+      if (inserted) {
+        setDriverAfterRegistration(inserted as DeliveryDriver, finalUser);
+      }
+
+      showToast('تم تقديم طلب تسجيل السائق ورفع الوثائق بنجاح! بياناتك قيد مراجعة الإدارة.', 'success');
+      void syncWithSupabase(activeUserId);
     } catch (err: any) {
-      setAuthError(err.message || 'حدث خطأ أثناء المصادقة.');
+      setLocalAuthError(err.message || 'حدث خطأ أثناء المصادقة والتسجيل.');
     } finally {
-      setAuthSubmitting(false);
+      setRegistrationSubmitting(false);
     }
   };
 
   const checkApprovalStatus = async () => {
     setIsSyncing(true);
     try {
-      const supabase = getClient();
-      if (supabase && supabaseUser?.id) {
-        await syncWithSupabase(supabaseUser.id);
-        const { data: refreshedDriver, error } = await supabase
-          .from('delivery_drivers')
-          .select('*')
-          .eq('user_id', supabaseUser.id)
-          .maybeSingle();
-
-        if (error) {
-          showToast(`خطأ في فحص الحالة: ${error.message}`, 'error');
-          return;
-        }
-
-        if (refreshedDriver) {
-          setCurrentDriver(refreshedDriver as DeliveryDriver);
-          setDriverNotFoundInTable(false);
-          if (refreshedDriver.status === 'approved' && refreshedDriver.is_active) {
-            showToast('تهانينا! تمت الموافقة على حسابك وتفعيله بنجاح من قبل الإدارة.', 'success');
-          } else if (refreshedDriver.status === 'rejected') {
-            showToast(`تم رفض الحساب من قبل الإدارة: ${refreshedDriver.rejection_reason || 'بيانات غير مستوفاة'}`, 'error');
-          } else if (!refreshedDriver.is_active) {
-            showToast('حسابك معطل حالياً بقرار إداري.', 'info');
-          } else {
-            showToast('حسابك لا يزال قيد المراجعة لدى لوحة الإدارة (pending_approval).', 'info');
-          }
+      await checkDriverStatus();
+      if (currentDriver) {
+        if (currentDriver.status === 'approved' && currentDriver.is_active) {
+          showToast('تهانينا! تمت الموافقة على حسابك وتفعيله بنجاح من قبل الإدارة.', 'success');
+        } else if (currentDriver.status === 'rejected') {
+          showToast(`تم رفض الحساب من قبل الإدارة: ${currentDriver.rejection_reason || 'بيانات غير مستوفاة'}`, 'error');
+        } else if (!currentDriver.is_active) {
+          showToast('حسابك معطل حالياً بقرار إداري.', 'info');
         } else {
-          setDriverNotFoundInTable(true);
-          showToast('لم يتم العثور على سجل سائق مرتبط بحسابك.', 'error');
+          showToast('حسابك لا يزال قيد المراجعة لدى لوحة الإدارة (pending_approval).', 'info');
         }
       }
-    } catch (err: any) {
+    } catch {
       showToast('حدث خطأ أثناء فحص حالة الحساب.', 'error');
     } finally {
       setIsSyncing(false);
@@ -1188,20 +1053,12 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    const supabase = getClient();
-    if (supabase) {
-      await supabase.auth.signOut();
-    }
-    if (currentDriver?.id) {
-      clearDriverOfflineCache(currentDriver.id);
-    }
+    await driverLogout();
+    ordersService.cleanup();
     setOrders([]);
     setSelectedOrder(null);
     setOrderHistory([]);
     setPendingOfflineCount(0);
-    setSupabaseUser(null);
-    setCurrentDriver(null);
-    setDriverNotFoundInTable(false);
     showToast('تم تسجيل الخروج ومسح بيانات الجلسة المحلية بأمان.');
   };
 
@@ -1221,46 +1078,38 @@ export default function App() {
   // Rule: Updating driver profile resets status to pending_approval and disables is_active
   const handleSaveDriverProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentDriver) return;
+    if (!currentDriver || isSavingProfile) return;
 
-    const supabase = getClient();
-    const updatedFields = {
-      phone: editPhone.trim(),
-      governorate_name: editGovernorateName.trim() || null,
-      governorate_code: editGovernorateCode.trim() || null,
-      markaz_name: editMarkazName.trim() || null,
-      vehicle_type: editVehicleType.trim() || null,
-      vehicle_plate: editVehiclePlate.trim() || null,
-      notes: editNotes.trim() || null,
-      // Mandatory rule: reverts to pending_approval and is_active = false until re-approved by admin
-      status: 'pending_approval' as DriverStatus,
-      is_active: false,
-      updated_at: new Date().toISOString(),
-    };
-
-    if (supabase) {
-      const { error: updateErr } = await supabase
-        .from('delivery_drivers')
-        .update(updatedFields)
-        .eq('id', currentDriver.id);
-
-      if (updateErr) {
-        showToast(`فشل تحديث بيانات السائق: ${updateErr.message}`, 'error');
-        return;
-      }
+    if (!editPhone.trim()) {
+      showToast('رقم الهاتف مطلوب وإلزامي.', 'error');
+      return;
     }
 
-    const updatedDriver: DeliveryDriver = {
-      ...currentDriver,
-      ...updatedFields,
-    };
+    setIsSavingProfile(true);
+    try {
+      const res = await saveDriverProfile({
+        phone: editPhone.trim(),
+        governorate_name: editGovernorateName.trim() || null,
+        governorate_code: editGovernorateCode.trim() || null,
+        markaz_name: editMarkazName.trim() || null,
+        vehicle_type: editVehicleType.trim() || null,
+        vehicle_plate: editVehiclePlate.trim() || null,
+        notes: editNotes.trim() || null,
+      });
 
-    setCurrentDriver(updatedDriver);
-    currentDriverRef.current = updatedDriver;
-    setEditProfileOpen(false);
-    showToast('تم حفظ التعديلات بنجاح. تم تحويل حسابك إلى (قيد مراجعة الإدارة pending_approval) وتعطيله مؤقتًا حتى إعادة الاعتماد.', 'info');
-    // Immediately re-evaluate orders based on new location
-    syncWithSupabase(updatedDriver.user_id || undefined);
+      if (!res.success) {
+        showToast(res.error || 'فشل تحديث بيانات السائق', 'error');
+        return;
+      }
+
+      setEditProfileOpen(false);
+      showToast('تم حفظ التعديلات بنجاح. تم تحويل حسابك إلى (قيد مراجعة الإدارة pending_approval) وتعطيله مؤقتًا حتى إعادة الاعتماد.', 'info');
+      void syncWithSupabase(currentDriver.user_id || undefined);
+    } catch (err: any) {
+      showToast(err.message || 'حدث خطأ أثناء حفظ التعديلات', 'error');
+    } finally {
+      setIsSavingProfile(false);
+    }
   };
 
   // Rule: Accept Order (Only if service enabled, driver approved, and driver is_active)
@@ -1852,7 +1701,7 @@ export default function App() {
   }, [orderCategoryView, counts, pharmacyCounts]);
 
   // 1. Initial Loading Screen / Splash Screen
-  if (isSplashActive || authLoading) {
+  if (authStatus === 'loading') {
     return <SplashScreen statusMessage={splashMessage} step={splashStep} splashImageSrc={splashImageSrc} />;
   }
 
@@ -1908,7 +1757,8 @@ export default function App() {
               type="button"
               onClick={() => {
                 setAuthMode('login');
-                setAuthError(null);
+                setLocalAuthError(null);
+                clearAuthError();
               }}
               className={`flex-1 py-2.5 rounded-xl transition flex items-center justify-center space-x-1.5 space-x-reverse ${
                 authMode === 'login'
@@ -1923,7 +1773,8 @@ export default function App() {
               type="button"
               onClick={() => {
                 setAuthMode('register');
-                setAuthError(null);
+                setLocalAuthError(null);
+                clearAuthError();
               }}
               className={`flex-1 py-2.5 rounded-xl transition flex items-center justify-center space-x-1.5 space-x-reverse ${
                 authMode === 'register'
@@ -1938,16 +1789,11 @@ export default function App() {
 
           {/* Form Card */}
           <div className="bg-white rounded-3xl border border-neutral-200 p-6 sm:p-8 shadow-xl">
-            {authError && (
+            {(localAuthError || driverAuthError) && (
               <div className="mb-5 p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-900 text-xs flex items-start space-x-2 space-x-reverse">
                 <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
                 <div className="font-semibold leading-relaxed space-y-2 flex-1">
-                  <p className="whitespace-pre-line">{authError}</p>
-                  {authError.includes('GRANT') && (
-                    <div className="mt-2 p-2.5 bg-neutral-900 text-emerald-400 font-mono text-[11px] rounded-xl select-all border border-neutral-800" dir="ltr">
-                      GRANT INSERT, UPDATE, SELECT ON public.delivery_drivers TO authenticated;
-                    </div>
-                  )}
+                  <p className="whitespace-pre-line">{localAuthError || driverAuthError}</p>
                 </div>
               </div>
             )}
@@ -2206,10 +2052,10 @@ export default function App() {
 
               <button
                 type="submit"
-                disabled={authSubmitting}
+                disabled={isAuthSubmitting || registrationSubmitting}
                 className="w-full py-3.5 rounded-xl text-xs font-bold text-white shadow-md transition flex items-center justify-center space-x-2 space-x-reverse bg-emerald-700 hover:bg-emerald-800 disabled:bg-emerald-400"
               >
-                {authSubmitting ? (
+                {isAuthSubmitting || registrationSubmitting ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
                     <span>جاري المعالجة والتحقق...</span>
@@ -2235,7 +2081,8 @@ export default function App() {
                   <button
                     onClick={() => {
                       setAuthMode('register');
-                      setAuthError(null);
+                      setLocalAuthError(null);
+                      clearAuthError();
                     }}
                     className="font-bold text-emerald-700 hover:text-emerald-900 underline"
                   >
@@ -2248,7 +2095,8 @@ export default function App() {
                   <button
                     onClick={() => {
                       setAuthMode('login');
-                      setAuthError(null);
+                      setLocalAuthError(null);
+                      clearAuthError();
                     }}
                     className="font-bold text-emerald-700 hover:text-emerald-900 underline"
                   >
@@ -2305,9 +2153,55 @@ export default function App() {
     );
   }
 
+  // Dedicated Error Screen when fetching driver fails or connection issue occurs
+  if (authStatus === 'error') {
+    return (
+      <div className="min-h-screen bg-neutral-100 flex flex-col justify-center items-center p-4 font-['Cairo',sans-serif] text-neutral-900" dir="rtl">
+        {toastMessage && (
+          <div className="fixed top-4 left-4 right-4 sm:left-auto sm:right-6 z-50 animate-in fade-in slide-in-from-top-4 duration-200 max-w-md">
+            <div className="p-4 rounded-2xl shadow-xl border bg-rose-50 text-rose-900 border-rose-200 text-xs font-semibold">
+              {toastMessage.text}
+            </div>
+          </div>
+        )}
+        <div className="bg-white max-w-lg w-full rounded-3xl border border-neutral-200 p-8 shadow-xl text-center space-y-6">
+          <div className="w-16 h-16 bg-rose-100 text-rose-700 rounded-2xl flex items-center justify-center mx-auto shadow-xs">
+            <AlertCircle className="w-8 h-8" />
+          </div>
+          <div className="inline-flex items-center space-x-1.5 space-x-reverse px-3 py-1 rounded-full text-xs font-extrabold bg-rose-100 text-rose-900 border border-rose-200">
+            <span>تعذر الاتصال بالخادم أو تحميل البيانات</span>
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-xl font-extrabold text-neutral-900">خطأ في الاتصال بقاعدة البيانات</h2>
+            <p className="text-xs text-neutral-600 leading-relaxed">
+              {driverAuthError || 'حدث خطأ أثناء محاولة الاتصال بالخادم أو جلب بيانات السائق. لم يتم إنهاء جلستك، ويمكنك المحاولة مجددًا فور استقرار الاتصال.'}
+            </p>
+          </div>
+          <div className="flex flex-col gap-2 pt-2">
+            <button
+              onClick={() => retryFetchDriver()}
+              disabled={isSyncingDriver}
+              className="w-full py-3 bg-emerald-700 hover:bg-emerald-800 disabled:bg-emerald-400 text-white rounded-xl font-bold text-xs shadow-md transition flex items-center justify-center space-x-2 space-x-reverse"
+            >
+              <RefreshCw className={`w-4 h-4 ${isSyncingDriver ? 'animate-spin' : ''}`} />
+              <span>إعادة المحاولة الآن</span>
+            </button>
+            <button
+              onClick={handleLogout}
+              className="w-full py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-xl font-bold text-xs transition flex items-center justify-center space-x-2 space-x-reverse"
+            >
+              <LogOut className="w-4 h-4 text-neutral-500" />
+              <span>تسجيل الخروج</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // 3. Gatekeeping: Check Driver Profile, Approval Status, and Active Status
   // If no driver record found in delivery_drivers table for this user
-  if (driverNotFoundInTable || !currentDriver) {
+  if (authStatus === 'no_record' || !currentDriver) {
     return (
       <div className="min-h-screen bg-neutral-100 flex flex-col justify-center items-center p-4 font-['Cairo',sans-serif] text-neutral-900" dir="rtl">
         {toastMessage && (
@@ -2353,7 +2247,7 @@ export default function App() {
   }
 
   // If Driver is PENDING APPROVAL -> STRICTLY BLOCK APP ENTRY!
-  if (currentDriver.status === 'pending_approval') {
+  if (authStatus === 'pending_approval' || currentDriver.status === 'pending_approval') {
     return (
       <div className="min-h-screen bg-neutral-100 flex flex-col justify-center items-center p-4 sm:p-6 font-['Cairo',sans-serif] text-neutral-900" dir="rtl">
         {toastMessage && (
@@ -2539,7 +2433,7 @@ export default function App() {
   }
 
   // If Driver is REJECTED -> STRICTLY BLOCK APP ENTRY!
-  if (currentDriver.status === 'rejected') {
+  if (authStatus === 'rejected' || currentDriver.status === 'rejected') {
     return (
       <div className="min-h-screen bg-neutral-100 flex flex-col justify-center items-center p-4 font-['Cairo',sans-serif] text-neutral-900" dir="rtl">
         {toastMessage && (
@@ -2579,7 +2473,7 @@ export default function App() {
   }
 
   // If Driver is INACTIVE -> STRICTLY BLOCK APP ENTRY!
-  if (!currentDriver.is_active) {
+  if (authStatus === 'disabled' || !currentDriver.is_active) {
     return (
       <div className="min-h-screen bg-neutral-100 flex flex-col justify-center items-center p-4 font-['Cairo',sans-serif] text-neutral-900" dir="rtl">
         {toastMessage && (

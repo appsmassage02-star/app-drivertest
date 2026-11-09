@@ -1,5 +1,4 @@
 import { DeliveryOrder, PharmacyOrder, OrderStatus, OrderFilter, OrderType, OrderItem } from '../types';
-import { initialRegularOrders, initialPharmacyOrders, mockOrderHistory } from './mockData';
 import { getSupabaseClient, isSupabaseConfigured, subscribeToRealtimeChanges } from './supabaseClient';
 
 // Helper to normalize delivery order status from DB
@@ -49,9 +48,9 @@ function resolveStorageUrl(client: any, rawPathOrUrl: string, defaultBucket = 'p
 }
 
 class OrdersService {
-  private regularOrders: DeliveryOrder[] = [...initialRegularOrders];
-  private pharmacyOrders: PharmacyOrder[] = [...initialPharmacyOrders];
-  private historyOrders: DeliveryOrder[] = [...mockOrderHistory];
+  private regularOrders: DeliveryOrder[] = [];
+  private pharmacyOrders: PharmacyOrder[] = [];
+  private historyOrders: DeliveryOrder[] = [];
   private listeners: Array<() => void> = [];
 
   // Concurrency & Debounce guards
@@ -90,6 +89,17 @@ class OrdersService {
 
   // Bind or switch driver session and zone
   public setDriverSession(driverId: string | null, zone?: { governorate?: string; center?: string }): void {
+    if (!driverId) {
+      this.currentDriverId = null;
+      this.currentDriverZone = {};
+      this.regularOrders = [];
+      this.pharmacyOrders = [];
+      this.historyOrders = [];
+      this.cleanupRealtime();
+      this.notify();
+      return;
+    }
+
     const hasChanged = this.currentDriverId !== driverId ||
       this.currentDriverZone.governorate !== zone?.governorate ||
       this.currentDriverZone.center !== zone?.center;
@@ -97,7 +107,7 @@ class OrdersService {
     if (hasChanged) {
       this.currentDriverId = driverId;
       this.currentDriverZone = zone || {};
-      console.log(`[OrdersService] Driver session set to: ${driverId || 'unassigned'} (Zone: ${zone?.governorate || '-'})`);
+      console.log(`[OrdersService] Driver session set to: ${driverId} (Zone: ${zone?.governorate || '-'})`);
       this.setupSupabaseRealtime();
       this.refreshOrders();
     }
@@ -183,6 +193,11 @@ class OrdersService {
     this.currentDriverZone = {};
     this.isFetching = false;
     this.fetchQueued = false;
+    this.regularOrders = [];
+    this.pharmacyOrders = [];
+    this.historyOrders = [];
+    this.lastSyncError = null;
+    this.notify();
   }
 
   // Setup Supabase Realtime using actual tables:
@@ -979,7 +994,7 @@ class OrdersService {
     return list;
   }
 
-  // Helper to ensure driver ID is never null
+  // Helper to ensure driver ID is resolved from delivery_drivers
   public async getEffectiveDriverId(client?: any): Promise<string> {
     if (this.currentDriverId) return this.currentDriverId;
     const sb = client || getSupabaseClient();
@@ -987,31 +1002,21 @@ class OrdersService {
       try {
         const { data: { user } } = await sb.auth.getUser();
         if (user) {
-          let { data: row } = await sb
+          const { data: row } = await sb
             .from('delivery_drivers')
             .select('id')
             .eq('user_id', user.id)
             .maybeSingle();
-          if (!row) {
-            const byId = await sb
-              .from('delivery_drivers')
-              .select('id')
-              .eq('id', user.id)
-              .maybeSingle();
-            row = byId.data;
-          }
           if (row?.id) {
             this.currentDriverId = String(row.id);
             return this.currentDriverId;
           }
-          this.currentDriverId = user.id;
-          return user.id;
         }
       } catch {
-        // fallback
+        // ignore
       }
     }
-    return this.currentDriverId || 'demo-driver-id';
+    return this.currentDriverId || '';
   }
 
   // Driver action execution with verified RPC calls strictly adhering to docs/SUPABASE_OPENAPI_REFERENCE.md
@@ -1142,11 +1147,11 @@ class OrdersService {
         return false;
       }
     } else {
-      // Demo mode only when Supabase is not configured
-      serverSuccess = true;
+      this.lastSyncError = 'لا يمكن تنفيذ العملية لعدم وجود اتصال بخادم قاعدة البيانات';
+      return false;
     }
 
-    // 2. Only update in-memory state if server confirmed success (or in demo mode)
+    // 2. Only update in-memory state if server confirmed success
     if (serverSuccess) {
       let updated = false;
 

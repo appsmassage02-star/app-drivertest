@@ -1,9 +1,6 @@
 import { DriverProfile, DriverStatus, DriverAvailability } from '../types';
 import { getSupabaseClient, isSupabaseConfigured } from './supabaseClient';
-import { mockDriverProfile, mockPendingDriverProfile } from './mockData';
 import { ordersService } from './ordersService';
-
-const CURRENT_DEMO_DRIVER_KEY = 'talabat_driver_demo_type';
 
 export interface DriverAuthResult {
   success: boolean;
@@ -13,18 +10,32 @@ export interface DriverAuthResult {
   requiresApproval?: boolean;
 }
 
+const DEFAULT_EMPTY_DRIVER_PROFILE: DriverProfile = {
+  id: '',
+  name: 'مندوب طلبات البيت',
+  phone: '',
+  email: '',
+  status: 'pending_approval',
+  availability: 'offline',
+  vehicleType: 'دراجة نارية',
+  vehiclePlate: '',
+  vehicleModel: '',
+  rating: 5.0,
+  totalTrips: 0,
+  completionRate: 100,
+  walletBalance: 0,
+  todayEarnings: 0,
+  todayTrips: 0,
+  workingZone: '',
+  joinedDate: new Date().toISOString(),
+};
+
 class DriverService {
-  private currentProfile: DriverProfile = { ...mockDriverProfile };
+  private currentProfile: DriverProfile = { ...DEFAULT_EMPTY_DRIVER_PROFILE };
   private listeners: Array<(profile: DriverProfile) => void> = [];
 
   constructor() {
-    // Check saved demo preference or initial state
-    if (typeof window !== 'undefined') {
-      const savedType = localStorage.getItem(CURRENT_DEMO_DRIVER_KEY);
-      if (savedType === 'pending') {
-        this.currentProfile = { ...mockPendingDriverProfile };
-      }
-    }
+    // Initialized in clean, unauthenticated offline state
   }
 
   // Subscribe to profile changes
@@ -40,101 +51,72 @@ class DriverService {
     this.listeners.forEach((listener) => listener(this.currentProfile));
   }
 
-  // Switch demo profile for easy testing between approved and pending states
-  public switchDemoDriver(type: 'approved' | 'pending'): DriverProfile {
-    if (type === 'pending') {
-      this.currentProfile = { ...mockPendingDriverProfile };
-      localStorage.setItem(CURRENT_DEMO_DRIVER_KEY, 'pending');
-    } else {
-      this.currentProfile = { ...mockDriverProfile };
-      localStorage.setItem(CURRENT_DEMO_DRIVER_KEY, 'approved');
-    }
-    this.notifyListeners();
-    return this.currentProfile;
-  }
-
-  // Get current active profile
+  // Get current active profile strictly from Supabase delivery_drivers table by user_id
   public async getDriverProfile(): Promise<DriverProfile> {
     const client = getSupabaseClient();
 
-    // If Supabase is configured and has an active session, attempt to inspect driver
     if (client && isSupabaseConfigured()) {
       try {
         const { data: { user } } = await client.auth.getUser();
         if (user) {
-          // Check if driver profile exists in potential tables without assuming unverified schemas
-          // First check user metadata
           const meta = user.user_metadata || {};
-          const phone = user.phone || meta.phone || this.currentProfile.phone;
-          const name = meta.full_name || meta.name || user.email?.split('@')[0] || 'مندوب طلبات البيت';
-          const status = (meta.driver_status || meta.status || 'approved') as DriverStatus;
+          const phone = user.phone || meta.phone || '';
+          const name = meta.full_name || meta.name || user.email?.split('@')[0] || 'مندوب';
 
-          // Query actual delivery_drivers table
-          let remoteProfile: Partial<DriverProfile> = {};
-          try {
-            // First try by user_id
-            let { data, error } = await client
-              .from('delivery_drivers')
-              .select('*')
-              .eq('user_id', user.id)
-              .maybeSingle();
+          // Query actual delivery_drivers table strictly by user_id
+          const { data, error } = await client
+            .from('delivery_drivers')
+            .select('*')
+            .eq('user_id', user.id)
+            .maybeSingle();
 
-            // If not found by user_id, try by id
-            if (!data && !error) {
-              const resById = await client
-                .from('delivery_drivers')
-                .select('*')
-                .eq('id', user.id)
-                .maybeSingle();
-              data = resById.data;
-              error = resById.error;
-            }
+          if (!error && data) {
+            const govName = data.governorate_name || data.governorate;
+            const markazName = data.markaz_name || data.center;
+            const zoneLabel = govName && markazName ? `${govName} - ${markazName}` : govName || markazName || '';
 
-            if (!error && data) {
-              const govName = data.governorate_name || data.governorate;
-              const markazName = data.markaz_name || data.center;
-              const zoneLabel = govName && markazName ? `${govName} - ${markazName}` : govName || markazName || this.currentProfile.workingZone;
-
-              remoteProfile = {
-                id: data.id || user.id,
-                userId: data.user_id || user.id,
-                name: data.full_name || name,
-                phone: data.phone || phone,
-                status: (data.status as DriverStatus) || status,
-                vehicleType: data.vehicle_type || this.currentProfile.vehicleType,
-                vehiclePlate: data.vehicle_plate || this.currentProfile.vehiclePlate,
-                vehicleModel: this.currentProfile.vehicleModel,
-                governorate_name: govName,
-                governorate_code: data.governorate_code,
-                markaz_name: markazName,
-                governorate: govName,
-                center: markazName,
-                workingZone: zoneLabel,
-                rejectionReason: data.rejection_reason || undefined,
-                rating: 5.0,
-                totalTrips: 0,
-                walletBalance: 0,
-              };
-            }
-          } catch (err) {
-            console.warn('[DriverService] Error querying delivery_drivers:', err);
+            this.currentProfile = {
+              id: data.id,
+              userId: data.user_id || user.id,
+              name: data.full_name || name,
+              phone: data.phone || phone,
+              email: user.email || '',
+              status: (data.status as DriverStatus) || 'pending_approval',
+              availability: data.is_active ? 'online' : 'offline',
+              vehicleType: data.vehicle_type || 'دراجة نارية',
+              vehiclePlate: data.vehicle_plate || '',
+              vehicleModel: '',
+              governorate_name: govName,
+              governorate_code: data.governorate_code,
+              markaz_name: markazName,
+              governorate: govName,
+              center: markazName,
+              workingZone: zoneLabel,
+              rejectionReason: data.rejection_reason || undefined,
+              rating: 5.0,
+              totalTrips: 0,
+              completionRate: 100,
+              walletBalance: 0,
+              todayEarnings: 0,
+              todayTrips: 0,
+              joinedDate: data.created_at || new Date().toISOString(),
+            };
+          } else {
+            // No record or error -> reset to unapproved stub
+            this.currentProfile = {
+              ...DEFAULT_EMPTY_DRIVER_PROFILE,
+              id: user.id,
+              userId: user.id,
+              email: user.email || '',
+              status: 'pending_approval',
+              availability: 'offline',
+            };
           }
-
-          this.currentProfile = {
-            ...this.currentProfile,
-            id: remoteProfile.id || user.id,
-            userId: user.id,
-            email: user.email || this.currentProfile.email,
-            name: remoteProfile.name || name,
-            phone: remoteProfile.phone || phone,
-            status: remoteProfile.status || status,
-            ...remoteProfile,
-          };
           this.notifyListeners();
           return this.currentProfile;
         }
       } catch (err) {
-        console.warn('Could not fetch Supabase driver profile, falling back to local state:', err);
+        console.warn('[DriverService] Error querying driver profile:', err);
       }
     }
 
@@ -143,43 +125,39 @@ class DriverService {
 
   // Update driver availability (online / offline)
   public async updateAvailability(availability: DriverAvailability): Promise<boolean> {
-    this.currentProfile.availability = availability;
-    this.notifyListeners();
-
     const client = getSupabaseClient();
-    if (client && isSupabaseConfigured()) {
-      try {
-        const { data: { user } } = await client.auth.getUser();
-        if (user) {
-          const isOnline = availability === 'online';
-          // 1. Persist in auth user_metadata safely
-          try {
-            await client.auth.updateUser({
-              data: { is_online: isOnline, availability },
-            });
-          } catch {
-            // ignore
-          }
-
-          // 2. Update delivery_drivers table using only real columns: is_active and updated_at
-          try {
-            await client
-              .from('delivery_drivers')
-              .update({
-                is_active: isOnline,
-                updated_at: new Date().toISOString(),
-              })
-              .or(`user_id.eq.${user.id},id.eq.${this.currentProfile.id}`);
-          } catch (tableErr) {
-            console.warn('delivery_drivers column update skipped:', tableErr);
-          }
-        }
-      } catch (err) {
-        console.warn('delivery_drivers status update error:', err);
-      }
+    if (!client || !isSupabaseConfigured() || !this.currentProfile.id) {
+      return false;
     }
 
-    return true;
+    try {
+      const { data: { user } } = await client.auth.getUser();
+      if (!user) return false;
+
+      const isOnline = availability === 'online';
+
+      // Update delivery_drivers table using only real columns: is_active and updated_at
+      const { error } = await client
+        .from('delivery_drivers')
+        .update({
+          is_active: isOnline,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', user.id)
+        .eq('id', this.currentProfile.id);
+
+      if (error) {
+        console.warn('[DriverService] Failed to update availability:', error.message);
+        return false;
+      }
+
+      this.currentProfile.availability = availability;
+      this.notifyListeners();
+      return true;
+    } catch (err) {
+      console.warn('[DriverService] Availability update exception:', err);
+      return false;
+    }
   }
 
   // Real Supabase login with Email & Password
@@ -188,7 +166,7 @@ class DriverService {
     if (!client) {
       return {
         success: false,
-        message: 'إعدادات Supabase غير متوفرة. يرجى إدخال الرابط والمفتاح في الإعدادات أو استخدام الوضع التجريبي.',
+        message: 'إعدادات Supabase غير متوفرة. يرجى إدخال الرابط والمفتاح في الإعدادات.',
         isMock: false,
       };
     }
@@ -209,16 +187,20 @@ class DriverService {
 
       if (data.user) {
         const profile = await this.getDriverProfile();
-        ordersService.setDriverSession(profile.id, {
-          governorate: profile.governorate,
-          center: profile.center,
-        });
+        if (profile.status === 'approved' && profile.availability === 'online') {
+          ordersService.setDriverSession(profile.id, {
+            governorate: profile.governorate,
+            center: profile.center,
+          });
+        } else {
+          ordersService.cleanup();
+        }
         return {
           success: true,
           message: 'تم تسجيل الدخول بنجاح عبر Supabase',
           driver: profile,
           isMock: false,
-          requiresApproval: profile.status === 'pending',
+          requiresApproval: profile.status !== 'approved',
         };
       }
 
@@ -236,25 +218,7 @@ class DriverService {
     }
   }
 
-  // Demo Login (One-click fast testing)
-  public async loginWithDemo(type: 'approved' | 'pending' = 'approved'): Promise<DriverAuthResult> {
-    // Simulate brief network delay
-    await new Promise((res) => setTimeout(res, 400));
-    const profile = this.switchDemoDriver(type);
-    ordersService.setDriverSession(profile.id, {
-      governorate: profile.governorate,
-      center: profile.center,
-    });
-    return {
-      success: true,
-      message: type === 'approved' ? 'تم الدخول ككابتن معتمد (بيانات تجريبية)' : 'تم الدخول بحساب قيد الاعتماد (بيانات تجريبية)',
-      driver: profile,
-      isMock: true,
-      requiresApproval: profile.status === 'pending',
-    };
-  }
-
-  // Logout (Requirement 6: clean up subscriptions and intervals)
+  // Logout (clean up subscriptions and session)
   public async logout(): Promise<void> {
     ordersService.cleanup();
     const client = getSupabaseClient();
@@ -265,8 +229,7 @@ class DriverService {
         console.warn('Supabase sign out error:', err);
       }
     }
-    // Reset to default mock
-    this.currentProfile = { ...mockDriverProfile, availability: 'offline' };
+    this.currentProfile = { ...DEFAULT_EMPTY_DRIVER_PROFILE };
     this.notifyListeners();
   }
 }

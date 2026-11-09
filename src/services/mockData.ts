@@ -34,7 +34,7 @@ export const mockPendingDriverProfile: DriverProfile = {
   phone: '0599887766',
   email: 'sami.driver@talabatalbayt.com',
   avatarUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=300&q=80',
-  status: 'pending',
+  status: 'pending_approval',
   availability: 'offline',
   vehicleType: 'دراجة نارية',
   vehicleModel: 'هوندا 150cc',

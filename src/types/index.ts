@@ -1,6 +1,17 @@
-export type DriverStatus = 'pending_approval' | 'approved' | 'rejected' | 'pending' | 'suspended';
+export type DriverStatus = 'pending_approval' | 'approved' | 'rejected';
 
 export type DriverAvailability = 'online' | 'offline' | 'busy';
+
+export type DriverAppState =
+  | 'no_session'            // لا توجد جلسة مصادقة
+  | 'loading'               // جارٍ فحص الجلسة أو تحميل بيانات السائق
+  | 'no_record'             // المستخدم مسجل في Auth ولكن لا يوجد سجل في delivery_drivers
+  | 'pending_approval'      // الحساب مسجل وقيد مراجعة واعتماد الإدارة
+  | 'approved_active'       // الحساب معتمد ونشط وجاهز لاستقبال الطلبات
+  | 'rejected'              // الحساب مرفوض بقرار إداري
+  | 'disabled'              // الحساب معطل (is_active = false)
+  | 'error';                // حدث خطأ في الاتصال أو أثناء جلب البيانات
+
 
 // --- Supabase Database Row Interfaces matching docs/SUPABASE_OPENAPI_REFERENCE.md ---
 
@@ -188,6 +199,33 @@ export interface SupabaseDeliveryDriverRow {
   vehicle_license_path?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface DeliveryDriver {
+  id: string;
+  user_id: string | null;
+  full_name: string;
+  phone: string;
+  is_active: boolean;
+  vehicle_type: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  status: DriverStatus;
+  governorate_name: string | null;
+  governorate_code: string | null;
+  markaz_name: string | null;
+  vehicle_plate: string | null;
+  national_id: string | null;
+  approved_at: string | null;
+  approved_by: string | null;
+  rejected_at: string | null;
+  rejected_by: string | null;
+  rejection_reason: string | null;
+  id_card_front_path?: string | null;
+  id_card_back_path?: string | null;
+  driver_license_path?: string | null;
+  vehicle_license_path?: string | null;
 }
 
 export interface SupabaseDeliveryOrderStatusHistoryRow {
