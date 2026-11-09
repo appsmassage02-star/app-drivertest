@@ -35,6 +35,7 @@ export function useDriverAuth(): UseDriverAuthReturn {
 
   // Sequence ref to prevent race conditions from concurrent or rapid auth events
   const fetchSeqRef = useRef<number>(0);
+  const isRetryingRef = useRef<boolean>(false);
   const currentDriverRef = useRef<DeliveryDriver | null>(null);
   currentDriverRef.current = currentDriver;
 
@@ -364,16 +365,19 @@ export function useDriverAuth(): UseDriverAuthReturn {
     setAuthStatus('no_session');
     setIsAuthSubmitting(false);
     setIsSyncingDriver(false);
+    isRetryingRef.current = false;
   };
 
   /**
    * Retry recovering session and fetching driver record (e.g. after connection/server error).
    * - Does NOT wipe the session on transient failure.
    * - Differentiates genuine absence of session from connection/server errors.
-   * - Prevents concurrent in-flight retries.
+   * - Prevents concurrent in-flight retries using immediate synchronous useRef lock.
    */
   const retryFetchDriver = async (): Promise<void> => {
-    if (isSyncingDriver) return; // Prevent concurrent retries
+    // Immediate synchronous lock via useRef to prevent concurrent executions
+    if (isRetryingRef.current) return;
+    isRetryingRef.current = true;
     setIsSyncingDriver(true);
     setAuthError(null);
 
@@ -382,6 +386,7 @@ export function useDriverAuth(): UseDriverAuthReturn {
       setAuthError('إعدادات الاتصال بـ Supabase غير مهيأة.');
       setAuthStatus('error');
       setIsSyncingDriver(false);
+      isRetryingRef.current = false;
       return;
     }
 
@@ -391,7 +396,6 @@ export function useDriverAuth(): UseDriverAuthReturn {
       if (sessionErr) {
         setAuthError(`تعذر استعادة الجلسة بسبب خطأ في الاتصال: ${sessionErr.message}`);
         setAuthStatus('error');
-        setIsSyncingDriver(false);
         return;
       }
 
@@ -401,7 +405,6 @@ export function useDriverAuth(): UseDriverAuthReturn {
         setSupabaseUser(null);
         setCurrentDriver(null);
         setAuthStatus('no_session');
-        setIsSyncingDriver(false);
         return;
       }
 
@@ -412,7 +415,6 @@ export function useDriverAuth(): UseDriverAuthReturn {
       if (result.state === 'error') {
         setAuthError(result.error || 'فشل الاتصال بقاعدة البيانات.');
         setAuthStatus('error');
-        setIsSyncingDriver(false);
         return;
       }
 
@@ -431,6 +433,7 @@ export function useDriverAuth(): UseDriverAuthReturn {
       setAuthError(err?.message || 'حدث خطأ في الاتصال أثناء إعادة المحاولة.');
       setAuthStatus('error');
     } finally {
+      isRetryingRef.current = false;
       setIsSyncingDriver(false);
     }
   };

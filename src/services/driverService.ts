@@ -58,6 +58,15 @@ class DriverService {
           }
 
           if (data) {
+            // Strict rule: Validate status. If missing or invalid, treat as incomplete data; do NOT assume pending_approval
+            const validStatuses: DriverStatus[] = ['pending_approval', 'approved', 'rejected'];
+            if (!data.status || !validStatuses.includes(data.status as DriverStatus)) {
+              console.warn('[DriverService] Driver record has missing or invalid status:', data.status);
+              this.currentProfile = null;
+              this.notifyListeners();
+              return null;
+            }
+
             const govName = data.governorate_name || data.governorate;
             const markazName = data.markaz_name || data.center;
             const zoneLabel = govName && markazName ? `${govName} - ${markazName}` : govName || markazName || '';
@@ -68,7 +77,7 @@ class DriverService {
               name: data.full_name || name,
               phone: data.phone || phone,
               email: user.email || '',
-              status: (data.status as DriverStatus) || 'pending_approval',
+              status: data.status as DriverStatus,
               availability: data.is_active ? 'online' : 'offline',
               vehicleType: data.vehicle_type || 'دراجة نارية',
               vehiclePlate: data.vehicle_plate || '',

@@ -306,6 +306,7 @@ export default function App() {
   const [driverLicense, setDriverLicense] = useState<UploadedDocument | null>(null);
   // Track documents verified as uploaded to Storage to avoid redundant uploads during retry
   const successfullyUploadedDocsRef = useRef<Set<string>>(new Set());
+  const acceptingOrderIdsRef = useRef<Set<string>>(new Set());
 
   // Memoized available centers for the currently selected governorate
   const availableCenters = useMemo(() => {
@@ -560,7 +561,8 @@ export default function App() {
           }
         }
 
-        const regularOrdersList: DeliveryOrder[] = [];
+        // Deduplicate orders by id to avoid duplicate cards during Realtime bursts
+        const orderMap = new Map<string, DeliveryOrder>();
         for (const row of rows) {
           const assignedDriverId = row.assigned_driver_id
             ? String(row.assigned_driver_id)
@@ -594,10 +596,19 @@ export default function App() {
 
           row.items = rawItems;
           row.assigned_driver_id = assignedDriverId;
-          regularOrdersList.push(row as DeliveryOrder);
+          const orderIdStr = String(row.id);
+          if (!orderMap.has(orderIdStr)) {
+            orderMap.set(orderIdStr, row as DeliveryOrder);
+          }
         }
 
+        const regularOrdersList = Array.from(orderMap.values());
         setOrders(regularOrdersList);
+        setSelectedOrder((prev) => {
+          if (!prev) return null;
+          const fresh = regularOrdersList.find((o) => o.id === prev.id);
+          return fresh || prev;
+        });
         if (driverId) {
           saveCachedDeliveryOrders(driverId, regularOrdersList);
         }
@@ -1055,6 +1066,7 @@ export default function App() {
 
   const handleLogout = async () => {
     successfullyUploadedDocsRef.current.clear();
+    acceptingOrderIdsRef.current.clear();
     await driverLogout();
     ordersService.cleanup();
     setOrders([]);
@@ -1141,13 +1153,26 @@ export default function App() {
       return;
     }
 
-    const supabase = getClient();
-    const now = new Date().toISOString();
+    // Concurrency Lock: Prevent multiple rapid clicks from accepting the same order twice
+    if (acceptingOrderIdsRef.current.has(order.id) || isActionLoading) {
+      return;
+    }
+    acceptingOrderIdsRef.current.add(order.id);
+    setIsActionLoading(true);
 
-    if (supabase) {
+    try {
+      const supabase = getClient();
+      if (!supabase) {
+        showToast('الاتصال بـ Supabase غير مهيأ.', 'error');
+        return;
+      }
+
+      const now = new Date().toISOString();
+
       const { error } = await supabase.rpc('accept_delivery_order', {
         p_order_id: order.id,
       });
+
       if (error) {
         const msg = (error.message || '').toLowerCase();
         if (
@@ -1155,7 +1180,9 @@ export default function App() {
           msg.includes('assigned') ||
           msg.includes('تم إسناد') ||
           msg.includes('not pending') ||
-          msg.includes('حالة أخرى')
+          msg.includes('حالة أخرى') ||
+          msg.includes('مقبول') ||
+          msg.includes('taken')
         ) {
           showToast('عذرًا، تم قبول هذا الطلب بالفعل من قبل سائق آخر.', 'error');
           setOrders((prev) => prev.filter((o) => o.id !== order.id));
@@ -1165,35 +1192,41 @@ export default function App() {
         }
         return;
       }
+
+      // Local State & History Update - only executed after confirmed server success
+      const updatedOrder: DeliveryOrder = {
+        ...order,
+        status: 'accepted',
+        assigned_driver_id: currentDriver.id,
+        accepted_at: now,
+        updated_at: now,
+      };
+
+      setOrders((prev) => prev.map((o) => (o.id === order.id ? updatedOrder : o)));
+      if (selectedOrder?.id === order.id) setSelectedOrder(updatedOrder);
+
+      const newHist: DeliveryOrderStatusHistory = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `hist-${Date.now()}`,
+        order_id: order.id,
+        old_status: 'pending_review',
+        new_status: 'accepted',
+        changed_by: currentDriver.id,
+        note: `تم قبول الطلب بواسطة السائق: ${currentDriver.full_name}`,
+        created_at: now,
+        previous_status: 'pending_review',
+        changed_by_role: 'delivery_driver',
+        notes: `تم قبول الطلب بواسطة السائق: ${currentDriver.full_name}`,
+      };
+
+      setOrderHistory((prev) => [newHist, ...prev]);
+      showToast('تم قبول الطلب بنجاح وهو الآن قيد التوصيل.', 'success');
+      await refreshOrderData(order.id);
+    } catch (err: any) {
+      showToast(`حدث خطأ أثناء قبول الطلب: ${err?.message || err}`, 'error');
+    } finally {
+      acceptingOrderIdsRef.current.delete(order.id);
+      setIsActionLoading(false);
     }
-
-    // Local State & History Update
-    const updatedOrder: DeliveryOrder = {
-      ...order,
-      status: 'accepted',
-      assigned_driver_id: currentDriver.id,
-      accepted_at: now,
-      updated_at: now,
-    };
-
-    setOrders((prev) => prev.map((o) => (o.id === order.id ? updatedOrder : o)));
-    if (selectedOrder?.id === order.id) setSelectedOrder(updatedOrder);
-
-    const newHist: DeliveryOrderStatusHistory = {
-      id: crypto.randomUUID ? crypto.randomUUID() : `hist-${Date.now()}`,
-      order_id: order.id,
-      old_status: 'pending_review',
-      new_status: 'accepted',
-      changed_by: currentDriver.id,
-      note: `تم قبول الطلب بواسطة السائق: ${currentDriver.full_name}`,
-      created_at: now,
-      previous_status: 'pending_review',
-      changed_by_role: 'delivery_driver',
-      notes: `تم قبول الطلب بواسطة السائق: ${currentDriver.full_name}`,
-    };
-
-    setOrderHistory((prev) => [newHist, ...prev]);
-    showToast('تم قبول الطلب بنجاح وهو الآن قيد التوصيل.', 'success');
   };
 
   // Helper: Refresh single order with items from Supabase
@@ -1646,9 +1679,17 @@ export default function App() {
           o.assigned_driver_id === currentDriver?.id
       );
     } else if (activeTab === 'completed') {
-      list = list.filter((o) => o.status === 'completed');
+      list = list.filter(
+        (o) =>
+          (o.status === 'completed' || o.status === 'delivered') &&
+          o.assigned_driver_id === currentDriver?.id
+      );
     } else if (activeTab === 'cancelled') {
-      list = list.filter((o) => o.status === 'cancelled' || o.status === 'cancellation_pending');
+      list = list.filter(
+        (o) =>
+          (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
+          (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
+      );
     }
 
     // Search query filter
@@ -1675,8 +1716,16 @@ export default function App() {
           (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed') &&
           o.assigned_driver_id === currentDriver?.id
       ).length,
-      completed: orders.filter((o) => o.status === 'completed').length,
-      cancelled: orders.filter((o) => o.status === 'cancelled' || o.status === 'cancellation_pending').length,
+      completed: orders.filter(
+        (o) =>
+          (o.status === 'completed' || o.status === 'delivered') &&
+          o.assigned_driver_id === currentDriver?.id
+      ).length,
+      cancelled: orders.filter(
+        (o) =>
+          (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
+          (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
+      ).length,
     }),
     [orders, currentDriver]
   );
