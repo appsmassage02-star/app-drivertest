@@ -136,16 +136,19 @@ export function useDriverAuth(): UseDriverAuthReturn {
       setSplashStep(1);
 
       try {
-        const { data: { session }, error: sessionErr } = await supabase!.auth.getSession();
+        const { data, error: sessionErr } = await supabase!.auth.getSession();
         if (!isMounted) return;
 
         if (sessionErr) {
           console.warn('[DriverAuth] Session check returned error:', sessionErr.message);
-          setAuthStatus('no_session');
+          setAuthError(`تعذر التحقق من جلسة المصادقة: ${sessionErr.message}`);
+          setAuthStatus('error');
           return;
         }
 
+        const session = data?.session;
         if (!session?.user) {
+          // Strictly set no_session only when Supabase confirms no active session exists
           setSupabaseUser(null);
           setCurrentDriver(null);
           setAuthStatus('no_session');
@@ -364,36 +367,71 @@ export function useDriverAuth(): UseDriverAuthReturn {
   };
 
   /**
-   * Retry fetching driver record (for example after connection error).
+   * Retry recovering session and fetching driver record (e.g. after connection/server error).
+   * - Does NOT wipe the session on transient failure.
+   * - Differentiates genuine absence of session from connection/server errors.
+   * - Prevents concurrent in-flight retries.
    */
   const retryFetchDriver = async (): Promise<void> => {
-    if (!supabaseUser) {
-      setAuthStatus('no_session');
-      return;
-    }
-
+    if (isSyncingDriver) return; // Prevent concurrent retries
     setIsSyncingDriver(true);
     setAuthError(null);
 
-    const result = await fetchDriverRecord(supabaseUser.id);
-    setIsSyncingDriver(false);
-
-    if (result.state === 'error') {
-      setAuthError(result.error || 'فشل الاتصال بقاعدة البيانات.');
+    const supabase = getSupabaseClient();
+    if (!supabase || !isSupabaseConfigured()) {
+      setAuthError('إعدادات الاتصال بـ Supabase غير مهيأة.');
       setAuthStatus('error');
+      setIsSyncingDriver(false);
       return;
     }
 
-    setCurrentDriver(result.driver);
-    setAuthStatus(result.state);
+    try {
+      // 1. Re-verify session from unified client
+      const { data, error: sessionErr } = await supabase.auth.getSession();
+      if (sessionErr) {
+        setAuthError(`تعذر استعادة الجلسة بسبب خطأ في الاتصال: ${sessionErr.message}`);
+        setAuthStatus('error');
+        setIsSyncingDriver(false);
+        return;
+      }
 
-    if (result.driver && result.state === 'approved_active') {
-      ordersService.setDriverSession(result.driver.id, {
-        governorate: result.driver.governorate_name || undefined,
-        center: result.driver.markaz_name || undefined,
-      });
-    } else {
-      ordersService.cleanup();
+      const session = data?.session;
+      if (!session?.user) {
+        // Confirmed that no session exists
+        setSupabaseUser(null);
+        setCurrentDriver(null);
+        setAuthStatus('no_session');
+        setIsSyncingDriver(false);
+        return;
+      }
+
+      // 2. Session exists, fetch driver record strictly linked via user_id
+      setSupabaseUser(session.user);
+      const result = await fetchDriverRecord(session.user.id, supabase);
+
+      if (result.state === 'error') {
+        setAuthError(result.error || 'فشل الاتصال بقاعدة البيانات.');
+        setAuthStatus('error');
+        setIsSyncingDriver(false);
+        return;
+      }
+
+      setCurrentDriver(result.driver);
+      setAuthStatus(result.state);
+
+      if (result.driver && result.state === 'approved_active') {
+        ordersService.setDriverSession(result.driver.id, {
+          governorate: result.driver.governorate_name || undefined,
+          center: result.driver.markaz_name || undefined,
+        });
+      } else {
+        ordersService.cleanup();
+      }
+    } catch (err: any) {
+      setAuthError(err?.message || 'حدث خطأ في الاتصال أثناء إعادة المحاولة.');
+      setAuthStatus('error');
+    } finally {
+      setIsSyncingDriver(false);
     }
   };
 

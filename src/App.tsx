@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   Truck,
   CheckCircle2,
@@ -72,6 +72,12 @@ import { usePharmacy } from './hooks/usePharmacy';
 import { useDriverAuth } from './hooks/useDriverAuth';
 import type { DeliveryDriver, DriverStatus, DriverAppState } from './types';
 import { ordersService } from './services/ordersService';
+import {
+  getSupabaseClient,
+  getSupabaseCredentials,
+  saveSupabaseCredentials,
+  isSupabaseConfigured,
+} from './services/supabaseClient';
 import { PharmacyOrdersSection } from './components/pharmacy/PharmacyOrdersSection';
 import { PharmacyRealtimeDiagnosticModal } from './components/pharmacy/PharmacyRealtimeDiagnosticModal';
 import { RealtimeConnectionStatus } from './types/pharmacy';
@@ -230,38 +236,10 @@ export interface DeliveryOrderStatusHistory {
 
 // ============================================================================
 // 2. Supabase Configuration & Real Authentication / Data State
+// Unified Single Client Instance (Delegated to services/supabaseClient.ts)
 // ============================================================================
 
-const STORAGE_KEY_URL = 'talabat_albayt_supabase_url';
-const STORAGE_KEY_KEY = 'talabat_albayt_supabase_anon_key';
-
-function getSupabaseCredentials() {
-  const metaEnv = (import.meta as any).env || {};
-  const envUrl = (metaEnv.VITE_SUPABASE_URL as string) || '';
-  const envKey = (metaEnv.VITE_SUPABASE_ANON_KEY as string) || '';
-  const localUrl = localStorage.getItem(STORAGE_KEY_URL) || '';
-  const localKey = localStorage.getItem(STORAGE_KEY_KEY) || '';
-  return {
-    url: localUrl || envUrl,
-    anonKey: localKey || envKey,
-  };
-}
-
-let cachedSupabase: SupabaseClient | null = null;
-export function getClient(): SupabaseClient | null {
-  const { url, anonKey } = getSupabaseCredentials();
-  if (!url || !anonKey) return null;
-  if (!cachedSupabase) {
-    try {
-      cachedSupabase = createClient(url, anonKey, {
-        auth: { persistSession: true, autoRefreshToken: true },
-      });
-    } catch {
-      return null;
-    }
-  }
-  return cachedSupabase;
-}
+export const getClient = getSupabaseClient;
 
 /**
  * Initiates a phone call to the customer using native Android / Capacitor / Web standard 'tel:' URI.
@@ -326,6 +304,8 @@ export default function App() {
   const [idCardBack, setIdCardBack] = useState<UploadedDocument | null>(null);
   const [vehicleLicense, setVehicleLicense] = useState<UploadedDocument | null>(null);
   const [driverLicense, setDriverLicense] = useState<UploadedDocument | null>(null);
+  // Track documents verified as uploaded to Storage to avoid redundant uploads during retry
+  const successfullyUploadedDocsRef = useRef<Set<string>>(new Set());
 
   // Memoized available centers for the currently selected governorate
   const availableCenters = useMemo(() => {
@@ -934,8 +914,13 @@ export default function App() {
       const uploadDocSafely = async (
         docPath: string,
         file: File,
-        label: string
-      ): Promise<{ success: boolean; path: string }> => {
+        labelAr: string
+      ): Promise<{ success: boolean; path: string; label: string; error?: string }> => {
+        // If already successfully uploaded in this registration session, avoid re-uploading
+        if (successfullyUploadedDocsRef.current.has(docPath)) {
+          return { success: true, path: docPath, label: labelAr };
+        }
+
         try {
           const { error: upErr } = await supabase.storage
             .from(bucketName)
@@ -945,23 +930,39 @@ export default function App() {
             });
 
           if (upErr) {
-            console.warn(`[DRIVER REGISTER] ${label} storage upload note (${upErr.message})`);
-            return { success: false, path: docPath };
+            console.warn(`[DRIVER REGISTER] ${labelAr} storage upload error:`, upErr.message);
+            return { success: false, path: docPath, label: labelAr, error: upErr.message };
           }
+
+          successfullyUploadedDocsRef.current.add(docPath);
           uploadedPaths.push(docPath);
-          return { success: true, path: docPath };
+          return { success: true, path: docPath, label: labelAr };
         } catch (storageErr: any) {
-          console.warn(`[DRIVER REGISTER] ${label} storage service note (${storageErr?.message})`);
-          return { success: false, path: docPath };
+          console.warn(`[DRIVER REGISTER] ${labelAr} storage service exception:`, storageErr?.message);
+          return {
+            success: false,
+            path: docPath,
+            label: labelAr,
+            error: storageErr?.message || 'تعذر الاتصال بوحدة التخزين',
+          };
         }
       };
 
-      await Promise.all([
-        uploadDocSafely(frontDocPath, frontFile, 'Front ID'),
-        uploadDocSafely(backDocPath, backFile, 'Back ID'),
-        uploadDocSafely(driverLicenseDocPath, driverLicenseFile, 'Driver License'),
-        uploadDocSafely(vehicleLicenseDocPath, vehicleLicenseFile, 'Vehicle License'),
+      // 2. Upload all 4 required documents concurrently and verify each result
+      const uploadResults = await Promise.all([
+        uploadDocSafely(frontDocPath, frontFile, 'بطاقة الهوية (الوجه الأمامي)'),
+        uploadDocSafely(backDocPath, backFile, 'بطاقة الهوية (الظهر)'),
+        uploadDocSafely(driverLicenseDocPath, driverLicenseFile, 'رخصة القيادة الشخصية'),
+        uploadDocSafely(vehicleLicenseDocPath, vehicleLicenseFile, 'رخصة تسيير المركبة'),
       ]);
+
+      const failedDocs = uploadResults.filter((r) => !r.success);
+      if (failedDocs.length > 0) {
+        const failedNames = failedDocs.map((d) => d.label).join('، ');
+        throw new Error(
+          `فشل رفع الوثائق المطلوبة التالية إلى مساحة التخزين: [${failedNames}]. تم إيقاف التسجيل ولن يُنشأ سجل السائق حتى اكتمال رفع كافة الوثائق بنجاح. يرجى التحقق من اتصالك بالإنترنت وإعادة المحاولة.`
+        );
+      }
 
       // Cache document previews locally for fast preview on this client device
       try {
@@ -1053,6 +1054,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    successfullyUploadedDocsRef.current.clear();
     await driverLogout();
     ordersService.cleanup();
     setOrders([]);
@@ -1622,16 +1624,10 @@ export default function App() {
     showToast('تم إرسال طلب الإلغاء بنجاح وهو الآن في انتظار قرار الإدارة (cancellation_pending).', 'info');
   };
 
-  // Save Supabase Configuration
+  // Save Supabase Configuration via Unified Client Service
   const handleSaveSupabaseConfig = (e: React.FormEvent) => {
     e.preventDefault();
-    if (supabaseUrl) localStorage.setItem(STORAGE_KEY_URL, supabaseUrl.trim());
-    else localStorage.removeItem(STORAGE_KEY_URL);
-
-    if (supabaseKey) localStorage.setItem(STORAGE_KEY_KEY, supabaseKey.trim());
-    else localStorage.removeItem(STORAGE_KEY_KEY);
-
-    cachedSupabase = null;
+    saveSupabaseCredentials(supabaseUrl, supabaseKey);
     showToast('تم حفظ إعدادات Supabase وجارٍ مزامنة البيانات...', 'info');
     syncWithSupabase();
   };

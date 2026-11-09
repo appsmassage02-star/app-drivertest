@@ -10,36 +10,16 @@ export interface DriverAuthResult {
   requiresApproval?: boolean;
 }
 
-const DEFAULT_EMPTY_DRIVER_PROFILE: DriverProfile = {
-  id: '',
-  name: 'مندوب طلبات البيت',
-  phone: '',
-  email: '',
-  status: 'pending_approval',
-  availability: 'offline',
-  vehicleType: 'دراجة نارية',
-  vehiclePlate: '',
-  vehicleModel: '',
-  rating: 5.0,
-  totalTrips: 0,
-  completionRate: 100,
-  walletBalance: 0,
-  todayEarnings: 0,
-  todayTrips: 0,
-  workingZone: '',
-  joinedDate: new Date().toISOString(),
-};
-
 class DriverService {
-  private currentProfile: DriverProfile = { ...DEFAULT_EMPTY_DRIVER_PROFILE };
-  private listeners: Array<(profile: DriverProfile) => void> = [];
+  private currentProfile: DriverProfile | null = null;
+  private listeners: Array<(profile: DriverProfile | null) => void> = [];
 
   constructor() {
-    // Initialized in clean, unauthenticated offline state
+    // Initialized with null profile
   }
 
   // Subscribe to profile changes
-  public onProfileChange(listener: (profile: DriverProfile) => void): () => void {
+  public onProfileChange(listener: (profile: DriverProfile | null) => void): () => void {
     this.listeners.push(listener);
     listener(this.currentProfile);
     return () => {
@@ -52,7 +32,7 @@ class DriverService {
   }
 
   // Get current active profile strictly from Supabase delivery_drivers table by user_id
-  public async getDriverProfile(): Promise<DriverProfile> {
+  public async getDriverProfile(): Promise<DriverProfile | null> {
     const client = getSupabaseClient();
 
     if (client && isSupabaseConfigured()) {
@@ -70,7 +50,14 @@ class DriverService {
             .eq('user_id', user.id)
             .maybeSingle();
 
-          if (!error && data) {
+          if (error) {
+            console.error('[DriverService] Database error querying driver profile:', error.message);
+            this.currentProfile = null;
+            this.notifyListeners();
+            return null;
+          }
+
+          if (data) {
             const govName = data.governorate_name || data.governorate;
             const markazName = data.markaz_name || data.center;
             const zoneLabel = govName && markazName ? `${govName} - ${markazName}` : govName || markazName || '';
@@ -101,32 +88,33 @@ class DriverService {
               todayTrips: 0,
               joinedDate: data.created_at || new Date().toISOString(),
             };
+            this.notifyListeners();
+            return this.currentProfile;
           } else {
-            // No record or error -> reset to unapproved stub
-            this.currentProfile = {
-              ...DEFAULT_EMPTY_DRIVER_PROFILE,
-              id: user.id,
-              userId: user.id,
-              email: user.email || '',
-              status: 'pending_approval',
-              availability: 'offline',
-            };
+            // Strict rule: No record in delivery_drivers -> return null, do not create stub
+            console.warn('[DriverService] No delivery_drivers record found for user_id:', user.id);
+            this.currentProfile = null;
+            this.notifyListeners();
+            return null;
           }
-          this.notifyListeners();
-          return this.currentProfile;
         }
       } catch (err) {
-        console.warn('[DriverService] Error querying driver profile:', err);
+        console.error('[DriverService] Error querying driver profile:', err);
+        this.currentProfile = null;
+        this.notifyListeners();
+        return null;
       }
     }
 
-    return this.currentProfile;
+    this.currentProfile = null;
+    this.notifyListeners();
+    return null;
   }
 
   // Update driver availability (online / offline)
   public async updateAvailability(availability: DriverAvailability): Promise<boolean> {
     const client = getSupabaseClient();
-    if (!client || !isSupabaseConfigured() || !this.currentProfile.id) {
+    if (!client || !isSupabaseConfigured() || !this.currentProfile?.id) {
       return false;
     }
 
@@ -187,6 +175,14 @@ class DriverService {
 
       if (data.user) {
         const profile = await this.getDriverProfile();
+        if (!profile) {
+          return {
+            success: false,
+            message: 'لم يتم العثور على سجل سائق مرتبط بحسابك في قاعدة البيانات.',
+            isMock: false,
+          };
+        }
+
         if (profile.status === 'approved' && profile.availability === 'online') {
           ordersService.setDriverSession(profile.id, {
             governorate: profile.governorate,
@@ -229,7 +225,7 @@ class DriverService {
         console.warn('Supabase sign out error:', err);
       }
     }
-    this.currentProfile = { ...DEFAULT_EMPTY_DRIVER_PROFILE };
+    this.currentProfile = null;
     this.notifyListeners();
   }
 }

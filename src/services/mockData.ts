@@ -1,3 +1,15 @@
+/**
+ * -----------------------------------------------------------------------------
+ * WARNING: TEST & DEVELOPMENT FIXTURES ONLY
+ * -----------------------------------------------------------------------------
+ * This file is strictly isolated for offline tests and prototype mockups.
+ * It must NEVER be imported or used as a production runtime fallback, default
+ * driver profile, or authentication alternative.
+ * All real driver authentication, profiles, and order data are sourced
+ * exclusively from Supabase (`delivery_drivers`, `delivery_orders`, etc.).
+ * -----------------------------------------------------------------------------
+ */
+
 import { DriverProfile, DeliveryOrder, PharmacyOrder } from '../types';
 
 export const mockDriverProfile: DriverProfile = {

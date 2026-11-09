@@ -2,6 +2,8 @@ import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabas
 
 const STORAGE_KEY_URL = 'talabat_driver_supabase_url';
 const STORAGE_KEY_KEY = 'talabat_driver_supabase_anon_key';
+const LEGACY_STORAGE_KEY_URL = 'talabat_albayt_supabase_url';
+const LEGACY_STORAGE_KEY_KEY = 'talabat_albayt_supabase_anon_key';
 
 let cachedClient: SupabaseClient | null = null;
 let cachedUrl = '';
@@ -14,14 +16,14 @@ export function getSupabaseCredentials(): { url: string; anonKey: string } {
 
   const storedUrl =
     typeof window !== 'undefined'
-      ? localStorage.getItem('talabat_driver_supabase_url') ||
-        localStorage.getItem('talabat_albayt_supabase_url') ||
+      ? localStorage.getItem(STORAGE_KEY_URL) ||
+        localStorage.getItem(LEGACY_STORAGE_KEY_URL) ||
         ''
       : '';
   const storedKey =
     typeof window !== 'undefined'
-      ? localStorage.getItem('talabat_driver_supabase_anon_key') ||
-        localStorage.getItem('talabat_albayt_supabase_anon_key') ||
+      ? localStorage.getItem(STORAGE_KEY_KEY) ||
+        localStorage.getItem(LEGACY_STORAGE_KEY_KEY) ||
         ''
       : '';
 
@@ -72,9 +74,15 @@ export function getSupabaseClient(): SupabaseClient | null {
 export function saveSupabaseCredentials(url: string, anonKey: string): boolean {
   try {
     if (typeof window !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY_URL, url.trim());
-      localStorage.setItem(STORAGE_KEY_KEY, anonKey.trim());
-      cachedClient = null; // force recreation
+      const cleanUrl = url.trim();
+      const cleanKey = anonKey.trim();
+      localStorage.setItem(STORAGE_KEY_URL, cleanUrl);
+      localStorage.setItem(STORAGE_KEY_KEY, cleanKey);
+      localStorage.setItem(LEGACY_STORAGE_KEY_URL, cleanUrl);
+      localStorage.setItem(LEGACY_STORAGE_KEY_KEY, cleanKey);
+      cachedClient = null; // force recreation of unified singleton client
+      cachedUrl = '';
+      cachedKey = '';
       return true;
     }
     return false;
@@ -89,6 +97,8 @@ export function clearSupabaseCredentials(): void {
     if (typeof window !== 'undefined') {
       localStorage.removeItem(STORAGE_KEY_URL);
       localStorage.removeItem(STORAGE_KEY_KEY);
+      localStorage.removeItem(LEGACY_STORAGE_KEY_URL);
+      localStorage.removeItem(LEGACY_STORAGE_KEY_KEY);
       cachedClient = null;
       cachedUrl = '';
       cachedKey = '';
