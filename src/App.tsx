@@ -9,6 +9,7 @@ import {
   Phone,
   User,
   Power,
+  Play,
   RefreshCw,
   Eye,
   X,
@@ -275,6 +276,7 @@ export default function App() {
     setDriverAfterRegistration,
     clearAuthError,
     retryFetchDriver,
+    updateDriverAvailabilityFields,
   } = useDriverAuth();
 
   const [splashImageSrc] = useState<string>(() => getInitialSplashAssetSrc());
@@ -342,6 +344,17 @@ export default function App() {
   const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
   const [pendingOfflineCount, setPendingOfflineCount] = useState<number>(0);
   const [isSyncingOfflineQueue, setIsSyncingOfflineQueue] = useState<boolean>(false);
+
+  // Driver Work Availability & Heartbeat States (is_available_for_work & availability_last_seen_at)
+  const [isWorking, setIsWorking] = useState<boolean>(false);
+  const [lastHeartbeatTime, setLastHeartbeatTime] = useState<string | null>(null);
+  const [isUpdatingAvailability, setIsUpdatingAvailability] = useState<boolean>(false);
+  const [heartbeatConsecutiveFailures, setHeartbeatConsecutiveFailures] = useState<number>(0);
+
+  const isWorkingRef = useRef<boolean>(false);
+  isWorkingRef.current = isWorking;
+  const heartbeatIntervalRef = useRef<any>(null);
+  const isHeartbeatInFlightRef = useRef<boolean>(false);
 
   // Shopping Flow States
   const [isActionLoading, setIsActionLoading] = useState(false);
@@ -751,6 +764,241 @@ export default function App() {
     };
   }, [currentDriver, triggerOfflineQueueSync, syncWithSupabase, showToast]);
 
+  // -------------------------------------------------------------
+  // Driver Work Availability & Heartbeat Management
+  // -------------------------------------------------------------
+
+  // Rule 4: Evaluate initial or restored availability on startup / driver load
+  // Driver is only considered available if is_available_for_work is true,
+  // last heartbeat is within 2 minutes (120,000 ms), and driver is approved & active.
+  useEffect(() => {
+    if (!currentDriver) {
+      setIsWorking(false);
+      setLastHeartbeatTime(null);
+      return;
+    }
+
+    // Must be approved and administratively active
+    if (currentDriver.status !== 'approved' || !currentDriver.is_active) {
+      setIsWorking(false);
+      return;
+    }
+
+    if (currentDriver.is_available_for_work && currentDriver.availability_last_seen_at) {
+      const lastSeenTime = new Date(currentDriver.availability_last_seen_at).getTime();
+      if (!isNaN(lastSeenTime)) {
+        const diffMs = Date.now() - lastSeenTime;
+        const TWO_MINUTES_MS = 2 * 60 * 1000; // 120,000 ms
+        // Active only if within 2 minutes threshold
+        if (diffMs >= 0 && diffMs <= TWO_MINUTES_MS) {
+          setIsWorking(true);
+          setLastHeartbeatTime(currentDriver.availability_last_seen_at);
+          return;
+        }
+      }
+    }
+
+    // If older than 2 minutes, false, or missing -> display as unavailable and do NOT auto-enable
+    setIsWorking(false);
+    if (currentDriver.availability_last_seen_at) {
+      setLastHeartbeatTime(currentDriver.availability_last_seen_at);
+    }
+  }, [
+    currentDriver?.id,
+    currentDriver?.status,
+    currentDriver?.is_active,
+    currentDriver?.is_available_for_work,
+    currentDriver?.availability_last_seen_at,
+  ]);
+
+  // Rule 3: Send Heartbeat to set_driver_availability(p_is_available: true)
+  const sendHeartbeat = useCallback(async () => {
+    if (!isWorkingRef.current || !navigator.onLine) return;
+    if (isHeartbeatInFlightRef.current) return;
+
+    const supabase = getClient();
+    if (!supabase) return;
+
+    const driver = currentDriverRef.current;
+    if (!driver || driver.status !== 'approved' || !driver.is_active) return;
+
+    isHeartbeatInFlightRef.current = true;
+    try {
+      const { error } = await supabase.rpc('set_driver_availability', {
+        p_is_available: true,
+      });
+
+      if (error) {
+        console.warn('[Heartbeat] set_driver_availability error:', error.message);
+        setHeartbeatConsecutiveFailures((prev) => {
+          const next = prev + 1;
+          if (next === 2) {
+            showToast('تنبيه: ضعف في إرسال نبضات الاتصال (Heartbeat) بالخادم.', 'info');
+          }
+          return next;
+        });
+      } else {
+        const nowIso = new Date().toISOString();
+        setLastHeartbeatTime(nowIso);
+        setHeartbeatConsecutiveFailures(0);
+        updateDriverAvailabilityFields(true, nowIso);
+      }
+    } catch (err) {
+      console.warn('[Heartbeat] exception:', err);
+      setHeartbeatConsecutiveFailures((prev) => prev + 1);
+    } finally {
+      isHeartbeatInFlightRef.current = false;
+    }
+  }, [showToast, updateDriverAvailabilityFields]);
+
+  // Single Heartbeat Timer (60 seconds) while working
+  useEffect(() => {
+    isWorkingRef.current = isWorking;
+
+    if (!isWorking) {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+      return;
+    }
+
+    // Clean up any existing timer to guarantee only one timer runs
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+
+    heartbeatIntervalRef.current = setInterval(() => {
+      void sendHeartbeat();
+    }, 60_000); // 60 seconds
+
+    return () => {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+    };
+  }, [isWorking, sendHeartbeat]);
+
+  // Immediate Heartbeat when returning to foreground
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && isWorkingRef.current) {
+        console.log('[Heartbeat] App resumed to foreground, triggering immediate heartbeat');
+        void sendHeartbeat();
+      }
+    };
+
+    const handleFocus = () => {
+      if (isWorkingRef.current) {
+        void sendHeartbeat();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [sendHeartbeat]);
+
+  // Start Work: set_driver_availability(p_is_available: true)
+  const handleStartWork = async () => {
+    if (isUpdatingAvailability) return;
+    if (!currentDriver) {
+      showToast('يرجى تسجيل الدخول أولاً.', 'error');
+      return;
+    }
+    if (currentDriver.status !== 'approved') {
+      showToast('لا يمكن بدء العمل لأن حسابك غير معتمد (status != approved).', 'error');
+      return;
+    }
+    if (!currentDriver.is_active) {
+      showToast('لا يمكن بدء العمل لأن حسابك معطل إدارياً (is_active = false).', 'error');
+      return;
+    }
+    if (!navigator.onLine) {
+      showToast('لا يمكن بدء العمل أثناء انقطاع الاتصال بالإنترنت.', 'error');
+      return;
+    }
+
+    const supabase = getClient();
+    if (!supabase) {
+      showToast('الاتصال بـ Supabase غير مهيأ.', 'error');
+      return;
+    }
+
+    setIsUpdatingAvailability(true);
+    try {
+      const { error } = await supabase.rpc('set_driver_availability', {
+        p_is_available: true,
+      });
+
+      if (error) {
+        showToast(`فشل بدء العمل: ${error.message}`, 'error');
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      setIsWorking(true);
+      setLastHeartbeatTime(nowIso);
+      setHeartbeatConsecutiveFailures(0);
+      updateDriverAvailabilityFields(true, nowIso);
+      showToast('تم بدء العمل بنجاح! أنت الآن متاح لاستقبال وتوصيل الطلبات.', 'success');
+    } catch (err: any) {
+      showToast(`حدث خطأ أثناء محاولة بدء العمل: ${err?.message || err}`, 'error');
+    } finally {
+      setIsUpdatingAvailability(false);
+    }
+  };
+
+  // Stop Work: set_driver_availability(p_is_available: false)
+  const handleStopWork = async () => {
+    if (isUpdatingAvailability) return;
+    if (!navigator.onLine) {
+      showToast('لا يمكن إيقاف العمل في الخادم أثناء انقطاع الاتصال بالإنترنت.', 'error');
+      return;
+    }
+
+    const supabase = getClient();
+    if (!supabase) {
+      showToast('الاتصال بـ Supabase غير مهيأ.', 'error');
+      return;
+    }
+
+    setIsUpdatingAvailability(true);
+    try {
+      const { error } = await supabase.rpc('set_driver_availability', {
+        p_is_available: false,
+      });
+
+      if (error) {
+        showToast(`فشل إيقاف العمل: ${error.message}`, 'error');
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      setIsWorking(false);
+      setLastHeartbeatTime(nowIso);
+      setHeartbeatConsecutiveFailures(0);
+
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+
+      updateDriverAvailabilityFields(false, nowIso);
+      showToast('تم إيقاف العمل بنجاح. أنت الآن غير متاح لاستقبال طلبات جديدة.', 'info');
+    } catch (err: any) {
+      showToast(`حدث خطأ أثناء محاولة إيقاف العمل: ${err?.message || err}`, 'error');
+    } finally {
+      setIsUpdatingAvailability(false);
+    }
+  };
+
   // Handle Driver Authentication (Login / Register)
   // Handle Driver Authentication (Login / Register)
   // CRITICAL RULE: Stage 1 creates delivery_driver record only. No Household, no profiles.
@@ -1065,6 +1313,24 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    // Attempt to set availability to false on server before signing out
+    if (isWorkingRef.current) {
+      try {
+        const supabase = getClient();
+        if (supabase) {
+          await supabase.rpc('set_driver_availability', { p_is_available: false });
+        }
+      } catch (err) {
+        console.warn('[Logout] Could not clear availability on server, will expire via heartbeat timeout:', err);
+      }
+    }
+
+    setIsWorking(false);
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+
     successfullyUploadedDocsRef.current.clear();
     acceptingOrderIdsRef.current.clear();
     await driverLogout();
@@ -1142,6 +1408,10 @@ export default function App() {
     }
     if (!currentDriver.is_active) {
       showToast('حسابك معطل حاليًا (is_active = false). يرجى تفعيل حسابك أولاً.', 'error');
+      return;
+    }
+    if (!isWorking) {
+      showToast('يجب الضغط على «بدء العمل» أولاً لتتمكن من استقبال وقبول الطلبات.', 'error');
       return;
     }
     if (!navigator.onLine) {
@@ -2642,6 +2912,36 @@ export default function App() {
               </div>
             )}
 
+            {/* Start / Stop Work Action Button in Header */}
+            {currentDriver && currentDriver.status === 'approved' && currentDriver.is_active && (
+              <div className="flex items-center">
+                {isWorking ? (
+                  <button
+                    type="button"
+                    onClick={handleStopWork}
+                    disabled={isUpdatingAvailability}
+                    className="flex items-center space-x-1.5 space-x-reverse px-3 py-1.5 rounded-xl text-xs font-extrabold bg-emerald-600 hover:bg-rose-600 active:scale-95 text-white shadow-xs transition group cursor-pointer"
+                    title="حالة العمل: متاح وجارٍ استقبال وتوصيل الطلبات - اضغط لإيقاف العمل"
+                  >
+                    <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+                    <span className="group-hover:hidden">متاح للعمل</span>
+                    <span className="hidden group-hover:inline">إيقاف العمل</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleStartWork}
+                    disabled={isUpdatingAvailability}
+                    className="flex items-center space-x-1.5 space-x-reverse px-3.5 py-1.5 rounded-xl text-xs font-extrabold bg-emerald-700 hover:bg-emerald-800 active:scale-95 text-white shadow-xs transition cursor-pointer disabled:bg-neutral-300"
+                    title="اضغط لبدء العمل واستقبال الطلبات"
+                  >
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>بدء العمل</span>
+                  </button>
+                )}
+              </div>
+            )}
+
             {/* Online / Offline & Sync Indicator */}
             <div
               className={`flex items-center space-x-1.5 space-x-reverse px-2.5 py-1 rounded-full text-xs font-bold border transition ${
@@ -2853,6 +3153,78 @@ export default function App() {
           </div>
         )}
 
+        {/* Driver Work Availability Control Card */}
+        {currentDriver && currentDriver.status === 'approved' && currentDriver.is_active && (
+          isWorking ? (
+            <div className="bg-emerald-50/90 border border-emerald-300/80 rounded-2xl p-3.5 px-4 text-emerald-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+              <div className="flex items-center space-x-3 space-x-reverse text-xs">
+                <span className="relative flex h-3 w-3 shrink-0">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-600"></span>
+                </span>
+                <div>
+                  <div className="flex items-center space-x-2 space-x-reverse">
+                    <span className="font-extrabold text-emerald-950 text-xs">أنت متاح للعمل الآن وتستقبل الطلبات</span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-200/80 text-emerald-900">
+                      نشط ومتاح
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-emerald-700 mt-0.5 flex items-center space-x-2 space-x-reverse">
+                    <span>نبض الاتصال (Heartbeat): فعال كل 60 ثانية</span>
+                    {lastHeartbeatTime && (
+                      <span className="text-emerald-800/80">
+                        (آخر تأكيد: {new Date(lastHeartbeatTime).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', second: '2-digit' })})
+                      </span>
+                    )}
+                    {heartbeatConsecutiveFailures > 0 && (
+                      <span className="text-rose-700 font-bold">
+                        (تنبيه: محاولة إعادة الاتصال #{heartbeatConsecutiveFailures})
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleStopWork}
+                disabled={isUpdatingAvailability}
+                className="px-4 py-2 bg-white hover:bg-rose-50 hover:text-rose-700 active:scale-95 text-neutral-800 border border-neutral-300 hover:border-rose-300 rounded-xl text-xs font-bold transition flex items-center justify-center space-x-1.5 space-x-reverse shrink-0 cursor-pointer shadow-2xs"
+              >
+                <Power className="w-3.5 h-3.5" />
+                <span>إيقاف العمل</span>
+              </button>
+            </div>
+          ) : (
+            <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-amber-950 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xs">
+              <div className="flex items-start space-x-3 space-x-reverse">
+                <div className="w-10 h-10 rounded-xl bg-amber-100 flex items-center justify-center shrink-0 text-amber-800">
+                  <PowerOff className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center space-x-2 space-x-reverse">
+                    <span className="text-sm font-extrabold text-amber-950">أنت متوقف عن العمل حالياً</span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-200/80 text-amber-900">
+                      غير متاح لاستقبال طلبات جديدة
+                    </span>
+                  </div>
+                  <p className="text-xs text-amber-800 mt-1 leading-relaxed">
+                    حسابك معتمد ومفعل. اضغط على «بدء العمل» لتسجيل نشاطك في النظام وتفعيل استقبال وقبول الطلبات في منطقتك.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleStartWork}
+                disabled={isUpdatingAvailability}
+                className="px-5 py-2.5 bg-emerald-700 hover:bg-emerald-800 active:scale-95 text-white rounded-xl text-xs font-extrabold shadow-sm transition flex items-center justify-center space-x-2 space-x-reverse shrink-0 cursor-pointer"
+              >
+                <Play className="w-4 h-4 fill-current" />
+                <span>بدء العمل الآن</span>
+              </button>
+            </div>
+          )
+        )}
+
         {/* Search Bar & Order Type Switcher (Regular Orders + Pharmacy Invoice) */}
         {['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab) && (
           <div className="space-y-3">
@@ -2983,16 +3355,22 @@ export default function App() {
                 <div className="w-16 h-16 rounded-2xl bg-neutral-100 flex items-center justify-center mx-auto mb-3 text-neutral-400">
                   <Package className="w-8 h-8" />
                 </div>
-                <h4 className="text-base font-bold text-neutral-800">لا توجد طلبات في هذا القسم</h4>
+                <h4 className="text-base font-bold text-neutral-800">
+                  {activeTab === 'pending' && !isWorking
+                    ? 'أنت متوقف عن العمل حاليًا'
+                    : 'لا توجد طلبات في هذا القسم'}
+                </h4>
                 <p className="text-xs text-neutral-500 mt-1 max-w-md mx-auto leading-relaxed">
                   {activeTab === 'pending'
-                    ? 'النظام في وضع الاستعداد اللحظي. بمجرد أن يرسل أحد المنازل طلبًا جديدًا، سيظهر هنا فورًا دون الحاجة لتحديث الصفحة.'
+                    ? !isWorking
+                      ? 'أنت غير متاح لاستقبال أو قبول طلبات جديدة في منطقتك. اضغط على «بدء العمل» في الأعلى أو في البطاقة لتفعيل حالتك واستقبال الطلبات.'
+                      : 'أنت متاح للعمل والنظام في وضع الاستعداد اللحظي. بمجرد أن يرسل أحد المنازل طلبًا جديدًا في منطقتك، سيظهر هنا فورًا.'
                     : 'بانتظار وصول وتحديث طلبات التوصيل من المنازل (Home App).'}
                 </p>
-                {activeTab === 'pending' && (
+                {activeTab === 'pending' && isWorking && (
                   <div className="mt-4 inline-flex items-center space-x-2 space-x-reverse px-3 py-1.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold">
                     <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
-                    <span>التحديث اللحظي فعال (Real-time Live Sync)</span>
+                    <span>التحديث اللحظي واستقبال الطلبات فعال</span>
                   </div>
                 )}
               </div>
@@ -3004,7 +3382,8 @@ export default function App() {
                     order.status === 'pending_review' &&
                     Boolean(settings?.delivery_enabled) &&
                     currentDriver?.status === 'approved' &&
-                    currentDriver?.is_active;
+                    currentDriver?.is_active &&
+                    isWorking;
                   const canStartShopping = order.status === 'accepted' && isAssignedToCurrent;
                   const isShopping = order.status === 'shopping' && isAssignedToCurrent;
                   const canComplete = order.status === 'shopping_completed' && isAssignedToCurrent;
@@ -3191,6 +3570,8 @@ export default function App() {
                                   ? 'حسابك غير معتمد'
                                   : !currentDriver?.is_active
                                   ? 'حسابك معطل'
+                                  : !isWorking
+                                  ? 'يجب الضغط على «بدء العمل» أولاً لقبول الطلبات'
                                   : 'قبول الطلب'
                               }
                             >

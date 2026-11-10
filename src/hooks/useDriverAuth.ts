@@ -21,6 +21,7 @@ export interface UseDriverAuthReturn {
   setDriverAfterRegistration: (driver: DeliveryDriver, user: User) => void;
   clearAuthError: () => void;
   retryFetchDriver: () => Promise<void>;
+  updateDriverAvailabilityFields: (isAvailable: boolean, lastSeenAt: string) => void;
 }
 
 export function useDriverAuth(): UseDriverAuthReturn {
@@ -527,6 +528,21 @@ export function useDriverAuth(): UseDriverAuthReturn {
     setAuthError(null);
   }, []);
 
+  /**
+   * Authoritative local state sync for work availability and last seen heartbeat
+   */
+  const updateDriverAvailabilityFields = useCallback((isAvailable: boolean, lastSeenAt: string) => {
+    setCurrentDriver((prev) =>
+      prev
+        ? {
+            ...prev,
+            is_available_for_work: isAvailable,
+            availability_last_seen_at: lastSeenAt,
+          }
+        : null
+    );
+  }, []);
+
   return {
     supabaseUser,
     currentDriver,
@@ -543,5 +559,6 @@ export function useDriverAuth(): UseDriverAuthReturn {
     setDriverAfterRegistration,
     clearAuthError,
     retryFetchDriver,
+    updateDriverAvailabilityFields,
   };
 }

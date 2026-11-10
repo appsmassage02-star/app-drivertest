@@ -78,7 +78,9 @@ class DriverService {
               phone: data.phone || phone,
               email: user.email || '',
               status: data.status as DriverStatus,
-              availability: data.is_active ? 'online' : 'offline',
+              availability: data.is_available_for_work ? 'online' : 'offline',
+              is_available_for_work: Boolean(data.is_available_for_work),
+              availability_last_seen_at: data.availability_last_seen_at || null,
               vehicleType: data.vehicle_type || 'دراجة نارية',
               vehiclePlate: data.vehicle_plate || '',
               vehicleModel: '',
@@ -120,39 +122,31 @@ class DriverService {
     return null;
   }
 
-  // Update driver availability (online / offline)
-  public async updateAvailability(availability: DriverAvailability): Promise<boolean> {
+  // Update driver work availability via authoritative RPC set_driver_availability
+  public async setWorkAvailability(isAvailable: boolean): Promise<boolean> {
     const client = getSupabaseClient();
     if (!client || !isSupabaseConfigured() || !this.currentProfile?.id) {
       return false;
     }
 
     try {
-      const { data: { user } } = await client.auth.getUser();
-      if (!user) return false;
-
-      const isOnline = availability === 'online';
-
-      // Update delivery_drivers table using only real columns: is_active and updated_at
-      const { error } = await client
-        .from('delivery_drivers')
-        .update({
-          is_active: isOnline,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('user_id', user.id)
-        .eq('id', this.currentProfile.id);
+      const { error } = await client.rpc('set_driver_availability', {
+        p_is_available: isAvailable,
+      });
 
       if (error) {
-        console.warn('[DriverService] Failed to update availability:', error.message);
+        console.warn('[DriverService] set_driver_availability RPC error:', error.message);
         return false;
       }
 
-      this.currentProfile.availability = availability;
+      const nowIso = new Date().toISOString();
+      this.currentProfile.is_available_for_work = isAvailable;
+      this.currentProfile.availability_last_seen_at = nowIso;
+      this.currentProfile.availability = isAvailable ? 'online' : 'offline';
       this.notifyListeners();
       return true;
     } catch (err) {
-      console.warn('[DriverService] Availability update exception:', err);
+      console.warn('[DriverService] set_driver_availability exception:', err);
       return false;
     }
   }

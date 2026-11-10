@@ -197,6 +197,8 @@ export interface SupabaseDeliveryDriverRow {
   id_card_back_path?: string;
   driver_license_path?: string;
   vehicle_license_path?: string;
+  is_available_for_work?: boolean;
+  availability_last_seen_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -226,6 +228,8 @@ export interface DeliveryDriver {
   id_card_back_path?: string | null;
   driver_license_path?: string | null;
   vehicle_license_path?: string | null;
+  is_available_for_work?: boolean;
+  availability_last_seen_at?: string | null;
 }
 
 export interface SupabaseDeliveryOrderStatusHistoryRow {
@@ -280,6 +284,8 @@ export interface DriverProfile {
   governorate_code?: string;
   markaz_name?: string;
   joinedDate: string;
+  is_available_for_work?: boolean;
+  availability_last_seen_at?: string | null;
   approvalNotes?: string;
   rejectionReason?: string;
   documentsSubmitted?: {
