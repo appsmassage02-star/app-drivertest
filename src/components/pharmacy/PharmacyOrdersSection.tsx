@@ -11,6 +11,7 @@ interface PharmacyOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
   searchQuery: string;
   currentDriver: DeliveryDriver | null;
+  isWorking?: boolean;
   deliveryEnabled: boolean;
   pharmacyOrders: PharmacyOrder[];
   selectedPharmacyOrder: PharmacyOrder | null;
@@ -70,6 +71,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   activeTab,
   searchQuery,
   currentDriver,
+  isWorking = true,
   deliveryEnabled,
   pharmacyOrders,
   selectedPharmacyOrder,
@@ -147,12 +149,30 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   }
 
   const canAcceptBase =
+    Boolean(isWorking) &&
     Boolean(deliveryEnabled) &&
     currentDriver?.status === 'approved' &&
     Boolean(currentDriver?.is_active);
 
   return (
     <div className="space-y-4">
+      {/* Work Availability Notice for Pharmacy Orders */}
+      {activeTab === 'pending' && !isWorking && (
+        <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 flex items-center space-x-3 space-x-reverse text-amber-950 shadow-2xs">
+          <div className="w-10 h-10 rounded-xl bg-amber-100 border border-amber-200 flex items-center justify-center shrink-0 text-amber-700">
+            <Pill className="w-5 h-5" />
+          </div>
+          <div className="text-xs leading-relaxed">
+            <strong className="block text-amber-950 font-extrabold text-sm mb-0.5">
+              أنت في وضع «متوقف عن العمل» حاليًا
+            </strong>
+            <span>
+              لقبول طلبات الصيدلية الجديدة واستقبال التكليفات، يجب الضغط أولاً على زر <strong>«بدء العمل»</strong> في الشريط العلوي لتفعيل حالة التوافر.
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Pharmacy Section Header Banner */}
       <div className="bg-gradient-to-l from-teal-900 via-teal-800 to-emerald-800 text-white rounded-2xl p-4 shadow-xs flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center space-x-3 space-x-reverse">
@@ -257,6 +277,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
               order={order}
               currentDriverId={currentDriver?.id}
               canAccept={canAcceptBase && order.status === 'pending_review'}
+              isWorking={isWorking}
               isActionLoading={isPharmacyActionLoading}
               onOpenDetails={(ord) => onSelectPharmacyOrder(ord)}
               onAcceptOrder={onAcceptOrder}
@@ -273,6 +294,8 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
       <PharmacyOrderDetailsModal
         order={selectedPharmacyOrder}
         currentDriverId={currentDriver?.id}
+        canAccept={canAcceptBase && selectedPharmacyOrder?.status === 'pending_review'}
+        isWorking={isWorking}
         isActionLoading={isPharmacyActionLoading}
         onClose={() => onSelectPharmacyOrder(null)}
         onAcceptOrder={onAcceptOrder}

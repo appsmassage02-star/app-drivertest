@@ -18,6 +18,7 @@ interface PharmacyOrderCardProps {
   order: PharmacyOrder;
   currentDriverId?: string | null;
   canAccept: boolean;
+  isWorking?: boolean;
   isActionLoading: boolean;
   onOpenDetails: (order: PharmacyOrder) => void;
   onAcceptOrder: (order: PharmacyOrder) => void;
@@ -72,6 +73,7 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
   order,
   currentDriverId,
   canAccept,
+  isWorking = true,
   isActionLoading,
   onOpenDetails,
   onAcceptOrder,
@@ -317,9 +319,20 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
               type="button"
               disabled={!canAccept || isActionLoading}
               onClick={() => onAcceptOrder(order)}
-              className="px-4 py-2 bg-teal-700 hover:bg-teal-800 active:scale-95 disabled:bg-neutral-300 text-white rounded-xl text-xs font-bold shadow-xs transition cursor-pointer"
+              title={
+                !isWorking
+                  ? 'يجب الضغط على «بدء العمل» أولاً لقبول الطلبات'
+                  : !canAccept
+                  ? 'غير مؤهل لقبول الطلب (تحقق من اعتماد الحساب وتفعيل الخدمة)'
+                  : 'قبول فاتورة الصيدلية'
+              }
+              className={`px-4 py-2 rounded-xl text-xs font-bold shadow-xs transition cursor-pointer ${
+                !canAccept
+                  ? 'bg-neutral-300 text-neutral-500 cursor-not-allowed opacity-80'
+                  : 'bg-teal-700 hover:bg-teal-800 text-white active:scale-95'
+              }`}
             >
-              قبول الطلب
+              {!isWorking ? 'بدء العمل مطلوب' : 'قبول الطلب'}
             </button>
           )}
 

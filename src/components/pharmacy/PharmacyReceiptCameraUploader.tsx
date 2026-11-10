@@ -57,7 +57,7 @@ export const PharmacyReceiptCameraUploader: React.FC<PharmacyReceiptCameraUpload
             مستند فاتورة الشراء من الصيدلية (صورة واحدة - كاميرا فقط)
           </label>
           <span className="text-[11px] text-neutral-500">
-            خاص بفاتورة شراء السائق من الصيدلية أثناء مرحلة التجهيز (shopping) فقط — وليس لرفع صور روشتة العميل
+            خاص بفاتورة شراء السائق من الصيدلية بالكاميرا المباشرة لإثبات الشراء والقيمة — وليس لرفع صور روشتة العميل
           </span>
         </div>
         {receiptImageUrl && (

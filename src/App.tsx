@@ -422,6 +422,7 @@ export default function App() {
     reconnectPharmacyRealtime,
   } = usePharmacy({
     currentDriver,
+    isWorking,
     deliveryEnabled: Boolean(settings?.delivery_enabled),
     onToast: showToast,
   });
@@ -3317,6 +3318,7 @@ export default function App() {
               activeTab={activeTab}
               searchQuery={searchQuery}
               currentDriver={currentDriver}
+              isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
               pharmacyOrders={pharmacyOrders}
               selectedPharmacyOrder={selectedPharmacyOrder}

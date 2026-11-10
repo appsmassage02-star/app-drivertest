@@ -15,11 +15,12 @@ import type { DeliveryDriver } from '../App';
 
 interface UsePharmacyOptions {
   currentDriver: DeliveryDriver | null;
+  isWorking?: boolean;
   deliveryEnabled: boolean;
   onToast?: (text: string, type?: 'success' | 'error' | 'info') => void;
 }
 
-export function usePharmacy({ currentDriver, deliveryEnabled, onToast }: UsePharmacyOptions) {
+export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled, onToast }: UsePharmacyOptions) {
   const [pharmacyOrders, setPharmacyOrders] = useState<PharmacyOrder[]>([]);
   const [selectedPharmacyOrder, setSelectedPharmacyOrder] = useState<PharmacyOrder | null>(null);
   const [isPharmacyLoading, setIsPharmacyLoading] = useState<boolean>(false);
@@ -44,6 +45,9 @@ export function usePharmacy({ currentDriver, deliveryEnabled, onToast }: UsePhar
   useEffect(() => {
     currentDriverRef.current = currentDriver;
   }, [currentDriver]);
+
+  // Concurrency lock to prevent duplicate clicks or parallel acceptance of pharmacy orders
+  const acceptingPharmacyOrderIdsRef = useRef<Set<string>>(new Set());
 
   const addDiagnosticLog = useCallback(
     (entry: Omit<RealtimeDiagnosticLog, 'id' | 'timestamp'>) => {
@@ -379,6 +383,10 @@ export function usePharmacy({ currentDriver, deliveryEnabled, onToast }: UsePhar
   // Accept Pharmacy Order
   const acceptPharmacyOrder = useCallback(
     async (order: PharmacyOrder) => {
+      if (!isWorking) {
+        notify('يجب الضغط على «بدء العمل» أولاً لتتمكن من استقبال وقبول طلبات الصيدلية.', 'error');
+        return;
+      }
       if (!deliveryEnabled) {
         notify('خدمة الدليفري معطلة حاليًا بقرار الإدارة العامة.', 'error');
         return;
@@ -395,6 +403,11 @@ export function usePharmacy({ currentDriver, deliveryEnabled, onToast }: UsePhar
         notify('حسابك غير معتمد أو غير نشط حاليًا.', 'error');
         return;
       }
+
+      if (acceptingPharmacyOrderIdsRef.current.has(order.id)) {
+        return;
+      }
+      acceptingPharmacyOrderIdsRef.current.add(order.id);
 
       setIsPharmacyActionLoading(true);
       try {
@@ -416,10 +429,11 @@ export function usePharmacy({ currentDriver, deliveryEnabled, onToast }: UsePhar
           notify(err.message || 'تعذر قبول فاتورة الصيدلية.', 'error');
         }
       } finally {
+        acceptingPharmacyOrderIdsRef.current.delete(order.id);
         setIsPharmacyActionLoading(false);
       }
     },
-    [currentDriver, deliveryEnabled, notify, syncUpdatedOrderInState]
+    [currentDriver, isWorking, deliveryEnabled, notify, syncUpdatedOrderInState]
   );
 
   // Start Shopping / Preparation

@@ -40,6 +40,8 @@ import { formatSafeDateTime } from '../../App';
 interface PharmacyOrderDetailsModalProps {
   order: PharmacyOrder | null;
   currentDriverId?: string | null;
+  canAccept?: boolean;
+  isWorking?: boolean;
   isActionLoading: boolean;
   onClose: () => void;
   onAcceptOrder: (order: PharmacyOrder) => void;
@@ -101,6 +103,8 @@ const VISIT_STOP_STATUS_OPTIONS = [
 export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps> = ({
   order,
   currentDriverId,
+  canAccept = true,
+  isWorking = true,
   isActionLoading,
   onClose,
   onAcceptOrder,
@@ -1627,25 +1631,19 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
           ) : (
             /* 6. Totals, Camera-Only Receipt & Complete Preparation Section (Problem 3 Fix) */
             <div className="space-y-4">
-              {/* If order is still `accepted`, show explicit guidance why receipt upload is locked until `shopping` starts */}
-              {order.status === 'accepted' && isAssignedToMe && (
-                <div className="p-3.5 bg-purple-50 border border-purple-200 rounded-2xl flex items-center justify-between gap-3 text-purple-950">
-                  <div className="text-[11px] leading-relaxed">
-                    <strong>تصوير فاتورة شراء الصيدلية:</strong> متاح فور الضغط على زر{' '}
-                    <strong>«بدء تجهيز الأدوية الآن (shopping)»</strong> بالأعلى (تمنع قواعد قاعدة البيانات رفع فاتورة الشراء قبل بدء مرحلة التجهيز الفعلي).
-                  </div>
-                </div>
-              )}
-
-              {/* Camera-Only Purchase Receipt Uploader (Rule 9) */}
-              {(order.status === 'shopping' ||
-                order.status === 'ready_for_delivery' ||
-                order.status === 'completed') && (
+              {/* Camera-Only Purchase Receipt Uploader (Available in any active stage) */}
+              {(isAssignedToMe || Boolean(order.receipt_image_url)) && (
                 <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200">
                   <PharmacyReceiptCameraUploader
                     receiptImageUrl={order.receipt_image_url}
                     receiptCapturedAt={order.receipt_captured_at}
-                    disabled={!isShopping || isActionLoading}
+                    disabled={
+                      !isAssignedToMe ||
+                      isActionLoading ||
+                      order.status === 'completed' ||
+                      order.status === 'cancelled' ||
+                      order.status === 'unable_to_fulfill'
+                    }
                     onSaveReceipt={(dataUrl) => onSaveReceiptImage(order.id, dataUrl)}
                   />
                 </div>
@@ -1821,11 +1819,22 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
             {order.status === 'pending_review' && (
               <button
                 type="button"
-                disabled={isActionLoading}
+                disabled={!canAccept || isActionLoading}
                 onClick={() => onAcceptOrder(order)}
-                className="px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white rounded-xl text-xs font-bold shadow-xs transition cursor-pointer"
+                title={
+                  !isWorking
+                    ? 'يجب الضغط على «بدء العمل» أولاً لقبول الطلبات'
+                    : !canAccept
+                    ? 'غير مؤهل لقبول الطلب (تحقق من اعتماد الحساب وتفعيل الخدمة)'
+                    : 'قبول فاتورة الصيدلية'
+                }
+                className={`px-4 py-2 rounded-xl text-xs font-bold shadow-xs transition cursor-pointer ${
+                  !canAccept
+                    ? 'bg-neutral-300 text-neutral-500 cursor-not-allowed opacity-80'
+                    : 'bg-teal-700 hover:bg-teal-800 text-white active:scale-95'
+                }`}
               >
-                قبول فاتورة الصيدلية
+                {!isWorking ? 'بدء العمل مطلوب لقبول الطلب' : 'قبول فاتورة الصيدلية'}
               </button>
             )}
 
