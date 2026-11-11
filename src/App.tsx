@@ -46,7 +46,8 @@ import {
   DollarSign,
   Store,
   Pill,
-  Activity
+  Activity,
+  UtensilsCrossed
 } from 'lucide-react';
 import {
   saveCachedDeliveryOrders,
@@ -82,6 +83,12 @@ import {
 import { PharmacyOrdersSection } from './components/pharmacy/PharmacyOrdersSection';
 import { PharmacyRealtimeDiagnosticModal } from './components/pharmacy/PharmacyRealtimeDiagnosticModal';
 import { RealtimeConnectionStatus } from './types/pharmacy';
+import { RestaurantOrdersSection } from './components/restaurant/RestaurantOrdersSection';
+import {
+  isRestaurantOrder,
+  isOrderDeliveredByRestaurant,
+  isRestaurantOrderForDriver,
+} from './lib/restaurantService';
 import {
   getInitialHeaderAssetSrc,
   getInitialSplashAssetSrc,
@@ -220,6 +227,16 @@ export interface DeliveryOrder {
   cancellation_requested_by: string | null;
   user_id: string | null;
   items?: DeliveryOrderItem[];
+  type?: 'regular' | 'pharmacy' | 'restaurant';
+  restaurant_id?: string | null;
+  restaurant_name?: string | null;
+  restaurant_phone?: string | null;
+  restaurant_address?: string | null;
+  delivery_by?: string | null;
+  is_restaurant_delivery?: boolean | null;
+  floor_number?: string | null;
+  apartment_number?: string | null;
+  building_name?: string | null;
 }
 
 export interface DeliveryOrderStatusHistory {
@@ -382,8 +399,9 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 4000);
   }, []);
 
-  // Order Category Filter ('all' | 'regular' | 'pharmacy') so "فاتورة صيدلية" is clearly displayed alongside regular orders
-  const [orderCategoryView, setOrderCategoryView] = useState<'all' | 'regular' | 'pharmacy'>('all');
+  // Order Category Filter ('all' | 'regular' | 'restaurant' | 'pharmacy')
+  const [orderCategoryView, setOrderCategoryView] = useState<'all' | 'regular' | 'restaurant' | 'pharmacy'>('all');
+  const [selectedRestaurantOrder, setSelectedRestaurantOrder] = useState<DeliveryOrder | null>(null);
 
   // Isolated Pharmacy Driver Hook (Stage 1: Service/Repository without Supabase mutations)
   const {
@@ -587,6 +605,11 @@ export default function App() {
             continue;
           }
 
+          // If restaurant order is delivered by the restaurant itself, Talabaty drivers must never receive it
+          if (isOrderDeliveredByRestaurant(row)) {
+            continue;
+          }
+
           // 2. If unassigned, must be in acceptable state and matching zone if set
           if (!assignedDriverId) {
             if (row.status === 'completed' || row.status === 'delivered' || row.status === 'cancelled') {
@@ -610,6 +633,7 @@ export default function App() {
 
           row.items = rawItems;
           row.assigned_driver_id = assignedDriverId;
+          row.type = isRestaurantOrder(row) ? 'restaurant' : 'regular';
           const orderIdStr = String(row.id);
           if (!orderMap.has(orderIdStr)) {
             orderMap.set(orderIdStr, row as DeliveryOrder);
@@ -619,6 +643,11 @@ export default function App() {
         const regularOrdersList = Array.from(orderMap.values());
         setOrders(regularOrdersList);
         setSelectedOrder((prev) => {
+          if (!prev) return null;
+          const fresh = regularOrdersList.find((o) => o.id === prev.id);
+          return fresh || prev;
+        });
+        setSelectedRestaurantOrder((prev) => {
           if (!prev) return null;
           const fresh = regularOrdersList.find((o) => o.id === prev.id);
           return fresh || prev;
@@ -1513,8 +1542,10 @@ export default function App() {
 
       if (!error && data) {
         const refreshed = data as DeliveryOrder;
+        refreshed.type = isRestaurantOrder(refreshed) ? 'restaurant' : 'regular';
         setOrders((prev) => prev.map((o) => (o.id === orderId ? refreshed : o)));
         setSelectedOrder((prev) => (prev?.id === orderId ? refreshed : prev));
+        setSelectedRestaurantOrder((prev) => (prev?.id === orderId ? refreshed : prev));
         return refreshed;
       }
     } catch (e) {
@@ -1654,6 +1685,21 @@ export default function App() {
         );
         if (selectedOrder?.id === item.order_id) {
           setSelectedOrder((prev) => {
+            if (!prev) return null;
+            const items = (prev.items || []).map((it) => {
+              if (it.id !== item.id) return it;
+              return {
+                ...it,
+                item_status: newStatus,
+                actual_unit_price: newStatus === 'purchased' ? actualPrice : it.actual_unit_price,
+                missing_reason: newStatus === 'missing' ? missingReason.trim() : null,
+              };
+            });
+            return { ...prev, items };
+          });
+        }
+        if (selectedRestaurantOrder?.id === item.order_id) {
+          setSelectedRestaurantOrder((prev) => {
             if (!prev) return null;
             const items = (prev.items || []).map((it) => {
               if (it.id !== item.id) return it;
@@ -1942,7 +1988,7 @@ export default function App() {
 
     // Status filter
     if (activeTab === 'pending') {
-      list = list.filter((o) => o.status === 'pending_review' && isOrderMatchingDriverTerritory(o, currentDriver));
+      list = list.filter((o) => (o.status === 'pending_review' || o.status === 'new') && isOrderMatchingDriverTerritory(o, currentDriver));
     } else if (activeTab === 'accepted') {
       list = list.filter(
         (o) =>
@@ -1971,50 +2017,90 @@ export default function App() {
           o.order_number?.toLowerCase().includes(q) ||
           o.customer_name?.toLowerCase().includes(q) ||
           o.customer_phone?.includes(q) ||
-          o.detailed_address?.toLowerCase().includes(q)
+          o.detailed_address?.toLowerCase().includes(q) ||
+          (o as any).restaurant_name?.toLowerCase().includes(q) ||
+          (o as any).store?.name?.toLowerCase().includes(q)
       );
     }
 
     return list;
   }, [orders, activeTab, currentDriver, searchQuery]);
 
-  // Order Counts
-  const counts = useMemo(
-    () => ({
-      pending: orders.filter((o) => o.status === 'pending_review' && isOrderMatchingDriverTerritory(o, currentDriver)).length,
-      accepted: orders.filter(
+  // Separate Home (Regular) vs Restaurant orders
+  const filteredHomeOrders = useMemo(() => {
+    return filteredOrders.filter((o) => !isRestaurantOrder(o));
+  }, [filteredOrders]);
+
+  const filteredRestaurantOrders = useMemo(() => {
+    return filteredOrders.filter((o) => isRestaurantOrderForDriver(o));
+  }, [filteredOrders]);
+
+  // Home (Regular) Order Counts
+  const homeCounts = useMemo(() => {
+    const homeList = orders.filter((o) => !isRestaurantOrder(o));
+    return {
+      pending: homeList.filter((o) => (o.status === 'pending_review' || o.status === 'new') && isOrderMatchingDriverTerritory(o, currentDriver)).length,
+      accepted: homeList.filter(
         (o) =>
           (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed') &&
           o.assigned_driver_id === currentDriver?.id
       ).length,
-      completed: orders.filter(
+      completed: homeList.filter(
         (o) =>
           (o.status === 'completed' || o.status === 'delivered') &&
           o.assigned_driver_id === currentDriver?.id
       ).length,
-      cancelled: orders.filter(
+      cancelled: homeList.filter(
         (o) =>
           (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
           (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
       ).length,
-    }),
-    [orders, currentDriver]
-  );
+    };
+  }, [orders, currentDriver]);
+
+  // Restaurant Order Counts
+  const restaurantCounts = useMemo(() => {
+    const restList = orders.filter((o) => isRestaurantOrderForDriver(o));
+    return {
+      pending: restList.filter((o) => (o.status === 'pending_review' || o.status === 'new') && isOrderMatchingDriverTerritory(o, currentDriver)).length,
+      accepted: restList.filter(
+        (o) =>
+          (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed') &&
+          o.assigned_driver_id === currentDriver?.id
+      ).length,
+      completed: restList.filter(
+        (o) =>
+          (o.status === 'completed' || o.status === 'delivered') &&
+          o.assigned_driver_id === currentDriver?.id
+      ).length,
+      cancelled: restList.filter(
+        (o) =>
+          (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
+          (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
+      ).length,
+    };
+  }, [orders, currentDriver]);
+
+  // Keep 'counts' as alias to homeCounts for backwards compatibility
+  const counts = homeCounts;
 
   const displayCounts = useMemo(() => {
     if (orderCategoryView === 'regular') {
-      return counts;
+      return homeCounts;
+    }
+    if (orderCategoryView === 'restaurant') {
+      return restaurantCounts;
     }
     if (orderCategoryView === 'pharmacy') {
       return pharmacyCounts;
     }
     return {
-      pending: counts.pending + pharmacyCounts.pending,
-      accepted: counts.accepted + pharmacyCounts.accepted,
-      completed: counts.completed + pharmacyCounts.completed,
-      cancelled: counts.cancelled + pharmacyCounts.cancelled,
+      pending: homeCounts.pending + restaurantCounts.pending + pharmacyCounts.pending,
+      accepted: homeCounts.accepted + restaurantCounts.accepted + pharmacyCounts.accepted,
+      completed: homeCounts.completed + restaurantCounts.completed + pharmacyCounts.completed,
+      cancelled: homeCounts.cancelled + restaurantCounts.cancelled + pharmacyCounts.cancelled,
     };
-  }, [orderCategoryView, counts, pharmacyCounts]);
+  }, [orderCategoryView, homeCounts, restaurantCounts, pharmacyCounts]);
 
   // 1. Initial Loading Screen / Splash Screen
   if (authStatus === 'loading') {
@@ -3257,12 +3343,40 @@ export default function App() {
                   <span>الطلبات العادية</span>
                   <span className="px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-900 text-[10px]">
                     {activeTab === 'pending'
-                      ? counts.pending
+                      ? homeCounts.pending
                       : activeTab === 'accepted'
-                      ? counts.accepted
+                      ? homeCounts.accepted
                       : activeTab === 'completed'
-                      ? counts.completed
-                      : counts.cancelled}
+                      ? homeCounts.completed
+                      : homeCounts.cancelled}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setOrderCategoryView('restaurant')}
+                  className={`px-3.5 py-2 rounded-xl transition flex items-center space-x-1.5 space-x-reverse cursor-pointer border ${
+                    orderCategoryView === 'restaurant'
+                      ? 'bg-amber-600 text-white border-amber-600 shadow-2xs'
+                      : 'bg-amber-50/80 text-amber-900 border-amber-200 hover:bg-amber-100'
+                  }`}
+                >
+                  <UtensilsCrossed className="w-3.5 h-3.5" />
+                  <span>طلبات المطاعم</span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded-full text-[10px] font-extrabold ${
+                      orderCategoryView === 'restaurant'
+                        ? 'bg-white text-amber-900'
+                        : 'bg-amber-200/80 text-amber-950'
+                    }`}
+                  >
+                    {activeTab === 'pending'
+                      ? restaurantCounts.pending
+                      : activeTab === 'accepted'
+                      ? restaurantCounts.accepted
+                      : activeTab === 'completed'
+                      ? restaurantCounts.completed
+                      : restaurantCounts.cancelled}
                   </span>
                 </button>
 
@@ -3347,12 +3461,39 @@ export default function App() {
           )}
 
         {/* ------------------------------------------------------------- */}
+        {/* RESTAURANT ORDERS SECTION (Hot Meals Delivery)                */}
+        {/* ------------------------------------------------------------- */}
+        {['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab) &&
+          (orderCategoryView === 'all' || orderCategoryView === 'restaurant') && (
+            <RestaurantOrdersSection
+              activeTab={activeTab}
+              searchQuery={searchQuery}
+              currentDriver={currentDriver}
+              isWorking={isWorking}
+              deliveryEnabled={Boolean(settings?.delivery_enabled)}
+              restaurantOrders={filteredRestaurantOrders}
+              selectedRestaurantOrder={selectedRestaurantOrder}
+              isActionLoading={isActionLoading}
+              isSyncing={isSyncing}
+              onRefreshOrders={() => void syncWithSupabase()}
+              onSelectOrder={setSelectedRestaurantOrder}
+              onAcceptOrder={handleAcceptOrder}
+              onStartShopping={handleStartShopping}
+              onUpdateDeliveryItem={handleUpdateDeliveryItem}
+              onCompleteShopping={handleCompleteShopping}
+              onCompleteOrder={handleCompleteOrder}
+              onOpenCancellationModal={(order) => setCancelModalOrder(order)}
+              onCallPhone={callCustomer}
+            />
+          )}
+
+        {/* ------------------------------------------------------------- */}
         {/* VIEW 1: REGULAR ORDERS LIST (Tabs: pending, accepted, completed, cancelled) */}
         {/* ------------------------------------------------------------- */}
         {['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab) &&
           (orderCategoryView === 'all' || orderCategoryView === 'regular') && (
           <div className="space-y-4">
-            {filteredOrders.length === 0 ? (
+            {filteredHomeOrders.length === 0 ? (
               <div className="bg-white rounded-2xl p-12 text-center border border-neutral-200 shadow-xs">
                 <div className="w-16 h-16 rounded-2xl bg-neutral-100 flex items-center justify-center mx-auto mb-3 text-neutral-400">
                   <Package className="w-8 h-8" />
@@ -3378,7 +3519,7 @@ export default function App() {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {filteredOrders.map((order) => {
+                {filteredHomeOrders.map((order) => {
                   const isAssignedToCurrent = order.assigned_driver_id === currentDriver?.id;
                   const canAccept =
                     order.status === 'pending_review' &&

@@ -1647,29 +1647,18 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
       console.warn('[SupabasePharmacyRepository] Storage upload fallback to data URL:', uploadErr);
     }
 
-    // Call RPC to register receipt image
-    let { error } = await supabase.rpc('pharmacy_driver_add_receipt', {
+    // Call authoritative RPC to register receipt image
+    const { error } = await supabase.rpc('pharmacy_driver_add_receipt', {
       p_order_id: orderId,
       p_storage_path: storagePath,
       p_mime_type: mimeType,
     });
 
     if (error) {
-      console.warn('[SupabasePharmacyRepository] pharmacy_driver_add_receipt RPC note:', error.message);
-      // Fallback: direct table update so receipt upload is never blocked by server RPC status restrictions
-      const { error: directErr } = await supabase
-        .from('pharmacy_orders')
-        .update({
-          receipt_image_url: storagePath,
-          receipt_captured_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', orderId);
-
-      if (directErr) {
-        console.warn('[SupabasePharmacyRepository] Direct receipt update note:', directErr.message);
-        throw new Error(error.message || directErr.message || 'تعذر حفظ صورة فاتورة الشراء.');
-      }
+      console.error('[SupabasePharmacyRepository] pharmacy_driver_add_receipt RPC failed:', error.message);
+      throw new Error(
+        error.message || 'تعذر حفظ صورة فاتورة الشراء عبر واجهة الخادم المعتمدة (pharmacy_driver_add_receipt).'
+      );
     }
 
     return this.fetchOrderOrThrow(orderId);

@@ -296,7 +296,7 @@ export interface DriverProfile {
   };
 }
 
-export type OrderType = 'regular' | 'pharmacy';
+export type OrderType = 'regular' | 'pharmacy' | 'restaurant';
 
 export type OrderStatus =
   | 'new'          // جديد في الانتظار
@@ -409,6 +409,16 @@ export interface DeliveryOrder {
   actual_items_total?: number | null;
   actual_total_amount?: number | null;
   raw_status?: string;
+  restaurant_id?: string;
+  restaurant_name?: string;
+  restaurant_phone?: string;
+  store_name?: string;
+  store_phone?: string;
+  store_address?: string;
+  pickup_address?: string;
+  delivery_by?: string;
+  delivered_by?: string;
+  is_restaurant_delivery?: boolean;
 }
 
 export interface PharmacyOrder extends DeliveryOrder {

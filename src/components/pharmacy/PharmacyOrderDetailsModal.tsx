@@ -1589,8 +1589,8 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
             )}
           </div>
 
-          {/* 5. Rule 5: All Items Unavailable -> Hide "Complete Preparation", Show "Call Customer" ONLY */}
-          {allItemsUnavailable ? (
+          {/* 5. Rule 5: All Items Unavailable Banner (Receipt tool remains available below) */}
+          {allItemsUnavailable && (
             <div className="p-5 bg-rose-50 border-2 border-rose-300 rounded-2xl space-y-3 text-center">
               <div className="w-12 h-12 rounded-2xl bg-rose-100 text-rose-700 flex items-center justify-center mx-auto">
                 <AlertTriangle className="w-6 h-6" />
@@ -1599,7 +1599,7 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
                 جميع الأصناف المطلوبة غير متوفرة
               </h4>
               <p className="text-xs text-rose-800 max-w-md mx-auto leading-relaxed">
-                بما أن جميع الأصناف أصبحت غير متوفرة، لا يمكن إتمام التجهيز أو الانتقال للتوصيل. يرجى الاتصال بالعميل مباشرة من خلال زر الاتصال أدناه.
+                بما أن جميع الأصناف أصبحت غير متوفرة، لا يمكن إتمام التجهيز أو الانتقال للتوصيل. يرجى الاتصال بالعميل مباشرة. يمكنك إرفاق فاتورة الشراء أو إثبات الزيارة أدناه إن لزم الأمر.
               </p>
               <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
                 <button
@@ -1628,26 +1628,23 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
                 )}
               </div>
             </div>
-          ) : (
-            /* 6. Totals, Camera-Only Receipt & Complete Preparation Section (Problem 3 Fix) */
+          )}
+
+          {/* 6. Camera-Only Purchase Receipt Uploader (Available in ALL order stages: accepted, shopping, ready_for_delivery, completed, cancelled, unable_to_fulfill, etc.) */}
+          {(isAssignedToMe || Boolean(order.receipt_image_url)) && (
+            <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200">
+              <PharmacyReceiptCameraUploader
+                receiptImageUrl={order.receipt_image_url}
+                receiptCapturedAt={order.receipt_captured_at}
+                disabled={!isAssignedToMe || isActionLoading}
+                onSaveReceipt={(dataUrl) => onSaveReceiptImage(order.id, dataUrl)}
+              />
+            </div>
+          )}
+
+          {/* 7. Totals & Complete Preparation Section (When items are available) */}
+          {!allItemsUnavailable && (
             <div className="space-y-4">
-              {/* Camera-Only Purchase Receipt Uploader (Available in any active stage) */}
-              {(isAssignedToMe || Boolean(order.receipt_image_url)) && (
-                <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200">
-                  <PharmacyReceiptCameraUploader
-                    receiptImageUrl={order.receipt_image_url}
-                    receiptCapturedAt={order.receipt_captured_at}
-                    disabled={
-                      !isAssignedToMe ||
-                      isActionLoading ||
-                      order.status === 'completed' ||
-                      order.status === 'cancelled' ||
-                      order.status === 'unable_to_fulfill'
-                    }
-                    onSaveReceipt={(dataUrl) => onSaveReceiptImage(order.id, dataUrl)}
-                  />
-                </div>
-              )}
 
               {/* End-of-Preparation Pricing Summary (Rule 8) */}
               <div className="bg-teal-50/60 p-4 sm:p-5 rounded-2xl border-2 border-teal-200 space-y-4">

@@ -350,7 +350,7 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
           )}
 
           {/* Continue Preparation */}
-          {isShopping && !allItemsUnavailable && (
+          {isShopping && (
             <button
               type="button"
               onClick={() => onOpenDetails(order)}
