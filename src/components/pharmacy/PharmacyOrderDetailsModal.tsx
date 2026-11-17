@@ -615,7 +615,7 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
               </span>
               <div className="font-extrabold text-neutral-900">
                 {order.governorate_name} - {order.markaz_name}
-                {order.delivery_area_name ? ` - ${order.delivery_area_name}` : ''}
+                {order.address_area_name ? ` - ${order.address_area_name}` : ''}
               </div>
               <div className="text-neutral-700 leading-relaxed">{order.detailed_address}</div>
               {order.delivery_notes ? (
@@ -1730,6 +1730,30 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
                           : 'البيانات المالية غير مكتملة'}
                       </span>
                     </div>
+                    {order.totals.delivery_base_fee != null && (
+                      <div className="flex justify-between text-neutral-600">
+                        <span>رسوم التوصيل الأساسية:</span>
+                        <span className="font-mono font-bold">
+                          {Number(order.totals.delivery_base_fee).toFixed(2)} ج.م
+                        </span>
+                      </div>
+                    )}
+                    {order.totals.customer_delivery_fee != null && (
+                      <div className="flex justify-between text-neutral-600">
+                        <span>رسوم التوصيل على العميل:</span>
+                        <span className="font-mono font-bold">
+                          {Number(order.totals.customer_delivery_fee).toFixed(2)} ج.م
+                        </span>
+                      </div>
+                    )}
+                    {order.totals.delivery_admin_commission != null && (
+                      <div className="flex justify-between text-neutral-600">
+                        <span>عمولة الإدارة المخزنة:</span>
+                        <span className="font-mono font-bold">
+                          {Number(order.totals.delivery_admin_commission).toFixed(2)} ج.م
+                        </span>
+                      </div>
+                    )}
                     {order.totals.delivery_driver_net != null && (
                       <div className="flex justify-between text-emerald-700 font-bold">
                         <span>صافي السائق المخزن:</span>

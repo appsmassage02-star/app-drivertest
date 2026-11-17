@@ -158,7 +158,7 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
             <span>
               <strong>
                 {order.governorate_name} - {order.markaz_name}
-                {order.delivery_area_name ? ` - ${order.delivery_area_name}` : ''}:
+                {order.address_area_name ? ` - ${order.address_area_name}` : ''}:
               </strong>{' '}
               {order.detailed_address}
             </span>

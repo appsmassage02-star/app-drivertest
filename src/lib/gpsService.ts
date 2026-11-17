@@ -190,7 +190,7 @@ export function validateGpsForTracking(
     };
   }
 
-  if (!settings || settings.driver_tracking_enabled === null) {
+  if (!settings || settings.load_state !== 'loaded' || settings.driver_tracking_enabled === null) {
     return {
       accepted: false,
       reasonCode: 'TRACKING_SETTINGS_UNAVAILABLE',

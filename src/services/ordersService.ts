@@ -784,7 +784,7 @@ class OrdersService {
             continue;
           }
           const hasCentralIds = Boolean(
-            row.delivery_area_id || row.delivery_center_id || row.delivery_governorate_id
+            row.address_area_id || row.address_center_id || row.address_governorate_id
           );
           if (hasCentralIds && driverRecord) {
             const matchRes = evaluateCentralCoverageMatch(row, driverRecord, geoContext);
@@ -892,16 +892,17 @@ class OrdersService {
 
         const fin = extractOrderFinancialBreakdown(row);
         const deliveryFee = fin.deliveryFee;
-        const medicinesTotal = Number(row.medicines_total || 0);
-        const grandTotal =
-          fin.totalAmount !== null
-            ? fin.totalAmount
-            : deliveryFee !== null
-            ? medicinesTotal + deliveryFee
-            : null;
-        const subtotal = medicinesTotal;
+        const subtotal = fin.subtotal;
+        const grandTotal = fin.totalAmount;
         const driverFee = fin.deliveryDriverNet;
         const isPaid = false;
+
+        const matchedPharmacyArea =
+          row.address_area_id && geoContext?.areas
+            ? geoContext.areas.find((a) => String(a.id) === String(row.address_area_id))
+            : null;
+        const resolvedPharmacyAreaName =
+          matchedPharmacyArea?.name_ar || matchedPharmacyArea?.name || null;
 
         const pharmacyOrder: PharmacyOrder = {
           id: rowIdStr,
@@ -937,8 +938,8 @@ class OrdersService {
               id: `ph-item-single-${row.id}`,
               name: row.prescription_title || 'أدوية ومستلزمات طبية',
               quantity: itemsCount,
-              unitPrice: subtotal,
-              totalPrice: subtotal,
+              unitPrice: subtotal ?? 0,
+              totalPrice: subtotal ?? 0,
             },
           ],
           itemsCount,
@@ -958,7 +959,7 @@ class OrdersService {
           hasColdStorageMedicines: false,
           invoiceUrl,
           invoiceStoragePath,
-          invoiceAmount: medicinesTotal > 0 ? medicinesTotal : undefined,
+          invoiceAmount: subtotal !== null && subtotal > 0 ? subtotal : undefined,
           urgencyLevel: 'normal',
           customerContacted: isCustomerContacted,
           assigned_driver_id: assignedDriverId || undefined,
@@ -968,6 +969,16 @@ class OrdersService {
           governorate_name: row.address_governorate_name,
           governorate_code: row.address_governorate_code,
           markaz_name: row.address_center_name,
+          address_governorate_id: row.address_governorate_id ?? null,
+          address_center_id: row.address_center_id ?? null,
+          address_area_id: row.address_area_id ?? null,
+          address_area_name: resolvedPharmacyAreaName,
+          delivery_fee: deliveryFee,
+          delivery_base_fee: fin.deliveryBaseFee,
+          delivery_admin_commission: fin.deliveryAdminCommission,
+          delivery_driver_net: fin.deliveryDriverNet,
+          customer_delivery_fee: fin.customerDeliveryFee,
+          total_amount: grandTotal,
         };
 
         if (orderStatus === 'delivered' || orderStatus === 'cancelled') {

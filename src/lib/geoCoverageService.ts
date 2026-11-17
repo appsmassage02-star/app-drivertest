@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
   CentralGeoContext,
+  DbFailedOperation,
   DeliveryDriver,
   DriverAffiliation,
   DriverAreaCoverageRow,
@@ -52,6 +53,7 @@ export function createEmptyCentralGeoContext(
     coverageRows: [],
     coverageLoadState: 'idle',
     coverageError: null,
+    coverageFailedOperation: null,
   };
 }
 
@@ -243,6 +245,7 @@ export async function fetchDriverCentralCoverage(
   coverageRows: DriverAreaCoverageRow[];
   coverageLoadState: CentralGeoContext['coverageLoadState'];
   coverageError: string | null;
+  coverageFailedOperation: DbFailedOperation | null;
 }> {
   const affiliation = resolveDriverAffiliation(driver);
 
@@ -252,6 +255,7 @@ export async function fetchDriverCentralCoverage(
       coverageRows: [],
       coverageLoadState: 'idle',
       coverageError: null,
+      coverageFailedOperation: null,
     };
   }
 
@@ -261,37 +265,34 @@ export async function fetchDriverCentralCoverage(
       : 'delivery_driver_area_coverage';
 
   try {
-    let queryRes = await supabase
+    const queryRes = await supabase
       .from(targetTable)
       .select('*')
       .eq('driver_id', driver.id);
 
-    // Some schemas on restaurant_driver_area_coverage may use restaurant_driver_id
-    if (
-      queryRes.error &&
-      affiliation === 'restaurant_staff' &&
-      String(queryRes.error.message || '').toLowerCase().includes('driver_id')
-    ) {
-      queryRes = await supabase
-        .from(targetTable)
-        .select('*')
-        .eq('restaurant_driver_id', driver.id);
-    }
-
     if (queryRes.error) {
+      const errorType = classifySupabaseError(queryRes.error);
+      const errMsg = queryRes.error.message || `تعذر قراءة جدول ${targetTable}`;
       return {
         driverAffiliation: affiliation,
         coverageRows: [],
-        coverageLoadState: classifySupabaseError(queryRes.error),
-        coverageError: queryRes.error.message || `تعذر قراءة جدول ${targetTable}`,
+        coverageLoadState: errorType,
+        coverageError: errMsg,
+        coverageFailedOperation: {
+          table: targetTable,
+          operation: 'SELECT',
+          errorType,
+          isRls: errorType === 'permission_denied',
+          code: queryRes.error.code ? String(queryRes.error.code) : null,
+          message: errMsg,
+        },
       };
     }
 
     const rawRows = Array.isArray(queryRes.data) ? queryRes.data : [];
     const coverageRows: DriverAreaCoverageRow[] = rawRows.map((r: any) => ({
       id: String(r.id),
-      driver_id: String(r.driver_id || r.restaurant_driver_id || driver.id),
-      restaurant_driver_id: r.restaurant_driver_id ? String(r.restaurant_driver_id) : null,
+      driver_id: String(r.driver_id || driver.id),
       restaurant_id: r.restaurant_id ? String(r.restaurant_id) : null,
       governorate_id: r.governorate_id ? String(r.governorate_id) : null,
       center_id: r.center_id ? String(r.center_id) : null,
@@ -307,13 +308,24 @@ export async function fetchDriverCentralCoverage(
       coverageRows,
       coverageLoadState: coverageRows.length > 0 ? 'loaded' : 'empty',
       coverageError: null,
+      coverageFailedOperation: null,
     };
   } catch (err: any) {
+    const errorType = classifySupabaseError(err);
+    const errMsg = err?.message || `خطأ في قراءة تغطية السائق من ${targetTable}`;
     return {
       driverAffiliation: affiliation,
       coverageRows: [],
-      coverageLoadState: 'error',
-      coverageError: err?.message || `خطأ في قراءة تغطية السائق من ${targetTable}`,
+      coverageLoadState: errorType,
+      coverageError: errMsg,
+      coverageFailedOperation: {
+        table: targetTable,
+        operation: 'SELECT',
+        errorType,
+        isRls: errorType === 'permission_denied',
+        code: err?.code ? String(err.code) : null,
+        message: errMsg,
+      },
     };
   }
 }
@@ -334,7 +346,14 @@ export async function loadFullCentralGeoContext(
 }
 
 function getOrderServiceCategory(order: any): 'regular' | 'restaurant' | 'pharmacy' {
-  if (order?.type === 'pharmacy' || order?.prescription_title || order?.address_governorate_name) {
+  if (
+    order?.type === 'pharmacy' ||
+    order?.prescription_title ||
+    order?.address_governorate_name ||
+    order?.address_governorate_id ||
+    order?.address_center_id ||
+    order?.address_area_id
+  ) {
     return 'pharmacy';
   }
   if (isRestaurantOrder(order)) {
@@ -450,10 +469,19 @@ export function evaluateCentralCoverageMatch(
     }
   }
 
-  // Extract central Geo IDs from the order
-  const rawAreaId = order?.delivery_area_id || order?.area_id || null;
-  const rawCenterId = order?.delivery_center_id || order?.center_id || null;
-  const rawGovId = order?.delivery_governorate_id || order?.governorate_id || null;
+  // Extract central Geo IDs from the order (pharmacy uses address_*_id strictly, others use delivery_*_id)
+  const rawAreaId =
+    orderService === 'pharmacy'
+      ? order?.address_area_id || null
+      : order?.delivery_area_id || order?.area_id || null;
+  const rawCenterId =
+    orderService === 'pharmacy'
+      ? order?.address_center_id || null
+      : order?.delivery_center_id || order?.center_id || null;
+  const rawGovId =
+    orderService === 'pharmacy'
+      ? order?.address_governorate_id || null
+      : order?.delivery_governorate_id || order?.governorate_id || null;
 
   const areaEntity = rawAreaId
     ? context.areas.find((a) => a.id === String(rawAreaId)) || null
@@ -517,9 +545,20 @@ export function evaluateCentralCoverageMatch(
           reasonCode: 'MATCHED_CENTRAL_COVERAGE',
           reason: 'مطابقة التغطية المركزية عبر معرف المنطقة (area_id).',
           matchedCoverageId: cov.id,
-          resolvedGovernorateName: govEntity?.name ?? order?.governorate_name ?? null,
-          resolvedCenterName: centerEntity?.name ?? order?.markaz_name ?? null,
-          resolvedAreaName: areaEntity?.name ?? order?.delivery_area_name ?? null,
+          resolvedGovernorateName:
+            govEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_governorate_name : null) ??
+            order?.governorate_name ??
+            null,
+          resolvedCenterName:
+            centerEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_center_name : null) ??
+            order?.markaz_name ??
+            null,
+          resolvedAreaName:
+            areaEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_area_name : order?.delivery_area_name) ??
+            null,
         };
       }
       continue;
@@ -532,9 +571,20 @@ export function evaluateCentralCoverageMatch(
           reasonCode: 'MATCHED_CENTRAL_COVERAGE',
           reason: 'مطابقة التغطية المركزية عبر معرف المركز (center_id).',
           matchedCoverageId: cov.id,
-          resolvedGovernorateName: govEntity?.name ?? order?.governorate_name ?? null,
-          resolvedCenterName: centerEntity?.name ?? order?.markaz_name ?? null,
-          resolvedAreaName: areaEntity?.name ?? order?.delivery_area_name ?? null,
+          resolvedGovernorateName:
+            govEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_governorate_name : null) ??
+            order?.governorate_name ??
+            null,
+          resolvedCenterName:
+            centerEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_center_name : null) ??
+            order?.markaz_name ??
+            null,
+          resolvedAreaName:
+            areaEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_area_name : order?.delivery_area_name) ??
+            null,
         };
       }
       continue;
@@ -547,9 +597,20 @@ export function evaluateCentralCoverageMatch(
           reasonCode: 'MATCHED_CENTRAL_COVERAGE',
           reason: 'مطابقة التغطية المركزية عبر معرف المحافظة (governorate_id).',
           matchedCoverageId: cov.id,
-          resolvedGovernorateName: govEntity?.name ?? order?.governorate_name ?? null,
-          resolvedCenterName: centerEntity?.name ?? order?.markaz_name ?? null,
-          resolvedAreaName: areaEntity?.name ?? order?.delivery_area_name ?? null,
+          resolvedGovernorateName:
+            govEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_governorate_name : null) ??
+            order?.governorate_name ??
+            null,
+          resolvedCenterName:
+            centerEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_center_name : null) ??
+            order?.markaz_name ??
+            null,
+          resolvedAreaName:
+            areaEntity?.name ??
+            (orderService === 'pharmacy' ? order?.address_area_name : order?.delivery_area_name) ??
+            null,
         };
       }
     }

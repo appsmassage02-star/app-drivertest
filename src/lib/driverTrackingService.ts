@@ -1,5 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { DeliverySystemSettings } from '../types';
+import type { DbFailedOperation, DeliverySystemSettings } from '../types';
 import {
   type DriverGPSLocation,
   validateGpsForTracking,
@@ -18,6 +18,7 @@ export interface TrackingPersistResult {
   currentLocationSaved: boolean;
   historySaved: boolean;
   errorDetails?: string | null;
+  failedOperations?: DbFailedOperation[];
 }
 
 function classifyDbError(err: any): 'permission_denied' | 'table_missing' | 'error' {
@@ -48,6 +49,22 @@ function classifyDbError(err: any): 'permission_denied' | 'table_missing' | 'err
   return 'error';
 }
 
+function buildFailedOperation(
+  table: string,
+  operation: DbFailedOperation['operation'],
+  err: any
+): DbFailedOperation {
+  const errorType = classifyDbError(err);
+  return {
+    table,
+    operation,
+    errorType,
+    isRls: errorType === 'permission_denied',
+    code: err?.code ? String(err.code) : null,
+    message: String(err?.message || err || `فشلت عملية ${operation} على جدول ${table}`),
+  };
+}
+
 function parseBool(val: any): boolean | null {
   if (typeof val === 'boolean') return val;
   if (val === 'true' || val === '1' || val === 1) return true;
@@ -75,6 +92,14 @@ export async function fetchDeliverySystemSettings(
       max_accepted_gps_accuracy_m: null,
       load_state: 'error',
       error_message: 'عميل Supabase غير مهيأ.',
+      failedOperation: {
+        table: 'delivery_system_settings',
+        operation: 'SELECT',
+        errorType: 'error',
+        isRls: false,
+        code: null,
+        message: 'عميل Supabase غير مهيأ.',
+      },
     };
   }
 
@@ -85,11 +110,13 @@ export async function fetchDeliverySystemSettings(
       .limit(25);
 
     if (error) {
+      const failedOp = buildFailedOperation('delivery_system_settings', 'SELECT', error);
       return {
         driver_tracking_enabled: null,
         max_accepted_gps_accuracy_m: null,
-        load_state: classifyDbError(error),
-        error_message: error.message || 'تعذر قراءة جدول delivery_system_settings.',
+        load_state: failedOp.errorType,
+        error_message: failedOp.message,
+        failedOperation: failedOp,
       };
     }
 
@@ -100,6 +127,7 @@ export async function fetchDeliverySystemSettings(
         max_accepted_gps_accuracy_m: null,
         load_state: 'empty',
         error_message: 'جدول delivery_system_settings فارغ.',
+        failedOperation: null,
       };
     }
 
@@ -115,6 +143,7 @@ export async function fetchDeliverySystemSettings(
         load_state: 'loaded',
         raw_record: first,
         error_message: null,
+        failedOperation: null,
       };
     }
 
@@ -137,13 +166,16 @@ export async function fetchDeliverySystemSettings(
       load_state: 'loaded',
       raw_record: first,
       error_message: null,
+      failedOperation: null,
     };
   } catch (err: any) {
+    const failedOp = buildFailedOperation('delivery_system_settings', 'SELECT', err);
     return {
       driver_tracking_enabled: null,
       max_accepted_gps_accuracy_m: null,
       load_state: 'error',
-      error_message: err?.message || 'خطأ أثناء قراءة إعدادات التتبع المركزية.',
+      error_message: failedOp.message,
+      failedOperation: failedOp,
     };
   }
 }
@@ -153,10 +185,8 @@ export async function fetchDeliverySystemSettings(
  * - delivery_driver_current_locations (upsert on driver_id)
  * - delivery_driver_locations (append history record)
  *
- * Strictly enforces:
- * - driver_tracking_enabled === true
- * - isMock !== true
- * - accuracy <= max_accepted_gps_accuracy_m
+ * Uses exact DB column names strictly (`accuracy_m`, `is_mocked`, `speed_mps`, `heading_degrees`)
+ * with zero retry fallbacks that drop fields, and reports any RLS or DB write failure explicitly.
  */
 export async function recordDriverLocation(
   supabase: SupabaseClient | null,
@@ -172,6 +202,7 @@ export async function recordDriverLocation(
       currentLocationSaved: false,
       historySaved: false,
       errorDetails: 'Missing supabase client or driverId',
+      failedOperations: [],
     };
   }
 
@@ -226,13 +257,16 @@ export async function recordDriverLocation(
     latitude: safeLoc.latitude,
     longitude: safeLoc.longitude,
     accuracy_m: safeLoc.accuracy,
-    accuracy: safeLoc.accuracy,
     recorded_at: safeLoc.recordedAt,
     updated_at: safeLoc.recordedAt,
     source: safeLoc.source,
-    is_mock: safeLoc.isMock ?? false,
-    ...(safeLoc.speed !== null && safeLoc.speed !== undefined ? { speed: safeLoc.speed } : {}),
-    ...(safeLoc.heading !== null && safeLoc.heading !== undefined ? { heading: safeLoc.heading } : {}),
+    is_mocked: safeLoc.isMock ?? false,
+    ...(safeLoc.speed !== null && safeLoc.speed !== undefined
+      ? { speed_mps: safeLoc.speed }
+      : {}),
+    ...(safeLoc.heading !== null && safeLoc.heading !== undefined
+      ? { heading_degrees: safeLoc.heading }
+      : {}),
   };
 
   const historyPayload: Record<string, any> = {
@@ -240,95 +274,82 @@ export async function recordDriverLocation(
     latitude: safeLoc.latitude,
     longitude: safeLoc.longitude,
     accuracy_m: safeLoc.accuracy,
-    accuracy: safeLoc.accuracy,
     recorded_at: safeLoc.recordedAt,
     source: safeLoc.source,
-    is_mock: safeLoc.isMock ?? false,
+    is_mocked: safeLoc.isMock ?? false,
     ...(activeOrderId ? { order_id: activeOrderId } : {}),
-    ...(safeLoc.speed !== null && safeLoc.speed !== undefined ? { speed: safeLoc.speed } : {}),
-    ...(safeLoc.heading !== null && safeLoc.heading !== undefined ? { heading: safeLoc.heading } : {}),
+    ...(safeLoc.speed !== null && safeLoc.speed !== undefined
+      ? { speed_mps: safeLoc.speed }
+      : {}),
+    ...(safeLoc.heading !== null && safeLoc.heading !== undefined
+      ? { heading_degrees: safeLoc.heading }
+      : {}),
   };
 
   let currentLocationSaved = false;
   let historySaved = false;
+  const failedOperations: DbFailedOperation[] = [];
   const errors: string[] = [];
 
-  // 1. Upsert into delivery_driver_current_locations (adapt gracefully if table uses accuracy vs accuracy_m)
+  // 1. Upsert into delivery_driver_current_locations (no field-stripping retry fallbacks)
   try {
-    let { error: curErr } = await supabase
+    const { error: curErr } = await supabase
       .from('delivery_driver_current_locations')
       .upsert(currentPayload, { onConflict: 'driver_id' });
 
-    if (curErr && String(curErr.message || '').toLowerCase().includes('accuracy_m')) {
-      const { accuracy_m: _drop, ...fallbackCurPayload } = currentPayload;
-      const retry = await supabase
-        .from('delivery_driver_current_locations')
-        .upsert(fallbackCurPayload, { onConflict: 'driver_id' });
-      curErr = retry.error;
-    } else if (curErr && String(curErr.message || '').toLowerCase().includes("'accuracy'")) {
-      const { accuracy: _drop, ...fallbackCurPayload } = currentPayload;
-      const retry = await supabase
-        .from('delivery_driver_current_locations')
-        .upsert(fallbackCurPayload, { onConflict: 'driver_id' });
-      curErr = retry.error;
-    }
-
     if (curErr) {
-      errors.push(`delivery_driver_current_locations: ${curErr.message}`);
+      const failedOp = buildFailedOperation('delivery_driver_current_locations', 'UPSERT', curErr);
+      failedOperations.push(failedOp);
+      errors.push(
+        `delivery_driver_current_locations [UPSERT${failedOp.isRls ? ' / RLS' : ''}]: ${failedOp.message}`
+      );
     } else {
       currentLocationSaved = true;
     }
   } catch (e: any) {
-    errors.push(`delivery_driver_current_locations: ${e?.message || e}`);
+    const failedOp = buildFailedOperation('delivery_driver_current_locations', 'UPSERT', e);
+    failedOperations.push(failedOp);
+    errors.push(`delivery_driver_current_locations [UPSERT]: ${failedOp.message}`);
   }
 
-  // 2. Insert into delivery_driver_locations
+  // 2. Insert into delivery_driver_locations (no field-stripping retry fallbacks)
   try {
-    let { error: histErr } = await supabase
+    const { error: histErr } = await supabase
       .from('delivery_driver_locations')
       .insert(historyPayload);
 
-    if (histErr && String(histErr.message || '').toLowerCase().includes('accuracy_m')) {
-      const { accuracy_m: _drop, ...fallbackHistPayload } = historyPayload;
-      const retry = await supabase
-        .from('delivery_driver_locations')
-        .insert(fallbackHistPayload);
-      histErr = retry.error;
-    } else if (histErr && String(histErr.message || '').toLowerCase().includes("'accuracy'")) {
-      const { accuracy: _drop, ...fallbackHistPayload } = historyPayload;
-      const retry = await supabase
-        .from('delivery_driver_locations')
-        .insert(fallbackHistPayload);
-      histErr = retry.error;
-    }
-
     if (histErr) {
-      errors.push(`delivery_driver_locations: ${histErr.message}`);
+      const failedOp = buildFailedOperation('delivery_driver_locations', 'INSERT', histErr);
+      failedOperations.push(failedOp);
+      errors.push(
+        `delivery_driver_locations [INSERT${failedOp.isRls ? ' / RLS' : ''}]: ${failedOp.message}`
+      );
     } else {
       historySaved = true;
     }
   } catch (e: any) {
-    errors.push(`delivery_driver_locations: ${e?.message || e}`);
+    const failedOp = buildFailedOperation('delivery_driver_locations', 'INSERT', e);
+    failedOperations.push(failedOp);
+    errors.push(`delivery_driver_locations [INSERT]: ${failedOp.message}`);
   }
 
-  if (currentLocationSaved || historySaved) {
+  if (currentLocationSaved && historySaved) {
     return {
       status: 'saved',
-      message:
-        errors.length === 0
-          ? 'تم تسجيل موقع السائق الفعلي في جداول التتبع بنجاح.'
-          : `تم تسجيل الموقع جزئيًا (${errors.join(' | ')})`,
-      currentLocationSaved,
-      historySaved,
-      errorDetails: errors.length > 0 ? errors.join(' | ') : null,
+      message: 'تم تسجيل موقع السائق الفعلي في جداول التتبع بنجاح.',
+      currentLocationSaved: true,
+      historySaved: true,
+      errorDetails: null,
+      failedOperations: [],
     };
   }
 
   return {
     status: 'db_error',
-    message: `تعذر حفظ موقع السائق في الخادم: ${errors.join(' | ')}`,
-    currentLocationSaved: false,
-    historySaved: false,
+    message: `تعذر إكمال حفظ موقع السائق في الخادم: ${errors.join(' | ')}`,
+    currentLocationSaved,
+    historySaved,
     errorDetails: errors.join(' | '),
+    failedOperations,
   };
 }

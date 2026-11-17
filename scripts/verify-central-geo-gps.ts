@@ -576,11 +576,12 @@ async function runTests() {
     assert.equal(upserts.length, 0);
     assert.equal(inserts.length, 0);
 
-    // 8d. Valid GPS reading when enabled -> saves to BOTH current & history tables
+    // 8d. Valid GPS reading when enabled -> saves to BOTH current & history tables using exact column names
+    const goodLocWithMotion = { ...goodLoc, speed: 4.5, heading: 180 };
     const savedRes = await recordDriverLocation(
       mockSettingsEnabled,
       'drv-platform',
-      goodLoc,
+      goodLocWithMotion,
       sysSettings,
       'ord-active-1'
     );
@@ -589,7 +590,19 @@ async function runTests() {
     assert.equal(savedRes.historySaved, true);
     assert.equal(upserts[0].table, 'delivery_driver_current_locations');
     assert.equal(inserts[0].table, 'delivery_driver_locations');
+    assert.equal(upserts[0].payload.accuracy_m, 18);
+    assert.equal(upserts[0].payload.is_mocked, false);
+    assert.equal(upserts[0].payload.speed_mps, 4.5);
+    assert.equal(upserts[0].payload.heading_degrees, 180);
+    assert.equal('accuracy' in upserts[0].payload, false);
+    assert.equal('is_mock' in upserts[0].payload, false);
+    assert.equal('speed' in upserts[0].payload, false);
+    assert.equal('heading' in upserts[0].payload, false);
     assert.equal(inserts[0].payload.order_id, 'ord-active-1');
+    assert.equal(inserts[0].payload.accuracy_m, 18);
+    assert.equal(inserts[0].payload.is_mocked, false);
+    assert.equal(inserts[0].payload.speed_mps, 4.5);
+    assert.equal(inserts[0].payload.heading_degrees, 180);
 
     // 8e. Verify getRealDriverGPS returns recordedAt, source, and accuracy
     Object.defineProperty(globalThis, 'navigator', {
@@ -659,19 +672,21 @@ async function runTests() {
 
     const phMatched = {
       id: 'ph-central-ok',
+      type: 'pharmacy',
       status: 'pending_review',
       governorate_name: 'الإسكندرية', // deliberately mismatched text!
       markaz_name: 'المنتزه',
-      delivery_area_id: 'area-toriel', // central ID matches!
+      address_area_id: 'area-toriel', // central ID matches!
     } as any;
     assert.equal(isPharmacyOrderMatchingDriverTerritory(phMatched, platformDriver, ctx), true);
 
     const phRejected = {
       id: 'ph-central-outside',
+      type: 'pharmacy',
       status: 'pending_review',
       governorate_name: 'القاهرة',
       markaz_name: 'المعادي',
-      delivery_area_id: 'area-gamaa', // outside driver's coverage (toriel only)!
+      address_area_id: 'area-gamaa', // outside driver's coverage (toriel only)!
     } as any;
     assert.equal(isPharmacyOrderMatchingDriverTerritory(phRejected, platformDriver, ctx), false);
 

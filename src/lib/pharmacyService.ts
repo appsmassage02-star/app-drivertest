@@ -18,7 +18,7 @@ import { normalizeArabicLocation } from '../data/locationOrderMatcher';
 import { getClient, type DeliveryDriver } from '../App';
 import { dataUrlToBlob } from '../components/DocumentUploader';
 import { ordersService } from '../services/ordersService';
-import type { CentralGeoContext } from '../types';
+import type { CentralGeoContext, GeoArea } from '../types';
 import {
   evaluateCentralCoverageMatch,
   loadFullCentralGeoContext,
@@ -233,7 +233,7 @@ export function parseStructuredCustomerNotes(rawNotes?: string | null): {
  * - Already assigned to this driver -> always true
  * - Assigned to another driver -> always false
  * - Restaurant staff drivers never receive platform pharmacy orders
- * - If pharmacy order carries central geo IDs (delivery_area_id / delivery_center_id / delivery_governorate_id),
+ * - If pharmacy order carries central geo IDs (address_area_id / address_center_id / address_governorate_id),
  *   strictly uses central geo coverage matching.
  * - Otherwise preserves legacy pharmacy matching cleanly (and checks active central coverage center names if loaded).
  */
@@ -252,7 +252,7 @@ export function isPharmacyOrderMatchingDriverTerritory(
   }
 
   const hasCentralOrderIds = Boolean(
-    order.delivery_area_id || order.delivery_center_id || order.delivery_governorate_id
+    order.address_area_id || order.address_center_id || order.address_governorate_id
   );
   if (hasCentralOrderIds) {
     return evaluateCentralCoverageMatch(order, driver, geoContext).matched;
@@ -369,7 +369,7 @@ export function doesPharmacyMatchOrderArea(
   return { govMatches, markazMatches };
 }
 
-const PHARMACY_ORDER_SELECT_QUERY = `
+export const PHARMACY_ORDER_SELECT_QUERY = `
   id,
   order_number,
   user_id,
@@ -382,8 +382,15 @@ const PHARMACY_ORDER_SELECT_QUERY = `
   status,
   medicines_total,
   delivery_fee,
+  delivery_base_fee,
+  delivery_admin_commission,
+  delivery_driver_net,
+  customer_delivery_fee,
   grand_total,
   source_address_id,
+  address_governorate_id,
+  address_center_id,
+  address_area_id,
   address_governorate_code,
   address_governorate_name,
   address_center_name,
@@ -520,7 +527,8 @@ function mapItemRow(row: any, orderStatus: PharmacyOrderStatus): PharmacyOrderIt
 function mapSupabaseOrderToPharmacyOrder(
   row: any,
   directItemsOverride?: any[],
-  itemsQueryError?: string | null
+  itemsQueryError?: string | null,
+  geoAreas?: GeoArea[]
 ): PharmacyOrder {
   const deliveryRow = unwrapSingle<any>(row.pharmacy_delivery_orders);
   const addressRow = unwrapSingle<any>(row.household_addresses);
@@ -738,7 +746,7 @@ function mapSupabaseOrderToPharmacyOrder(
     };
   }
 
-  // Totals: preserve stored fields without fake defaults
+  // Totals: preserve stored fields strictly without local calculation fallback
   const medicinesTotal =
     row.medicines_total !== null && row.medicines_total !== undefined
       ? Number(row.medicines_total)
@@ -748,8 +756,6 @@ function mapSupabaseOrderToPharmacyOrder(
   const finalTotal =
     row.grand_total !== null && row.grand_total !== undefined
       ? Number(row.grand_total)
-      : medicinesTotal !== null && deliveryFee !== null
-      ? Number((medicinesTotal + deliveryFee).toFixed(2))
       : null;
 
   // Compensation status from pharmacy_driver_compensation
@@ -795,8 +801,10 @@ function mapSupabaseOrderToPharmacyOrder(
     addressRow?.detailed_address ||
     '';
 
-  const deliveryLatRaw = row.delivery_latitude ?? row.address_latitude ?? addressRow?.latitude ?? null;
-  const deliveryLngRaw = row.delivery_longitude ?? row.address_longitude ?? addressRow?.longitude ?? null;
+  const resolvedAddressArea =
+    row.address_area_id && Array.isArray(geoAreas)
+      ? geoAreas.find((a) => String(a.id) === String(row.address_area_id)) || null
+      : null;
 
   return {
     id: String(row.id),
@@ -821,12 +829,10 @@ function mapSupabaseOrderToPharmacyOrder(
         : addressRow?.longitude !== null && addressRow?.longitude !== undefined
         ? Number(addressRow.longitude)
         : null,
-    delivery_governorate_id: row.delivery_governorate_id ?? null,
-    delivery_center_id: row.delivery_center_id ?? null,
-    delivery_area_id: row.delivery_area_id ?? null,
-    delivery_area_name: row.delivery_area_name ?? null,
-    delivery_latitude: deliveryLatRaw !== null && deliveryLatRaw !== undefined ? Number(deliveryLatRaw) : null,
-    delivery_longitude: deliveryLngRaw !== null && deliveryLngRaw !== undefined ? Number(deliveryLngRaw) : null,
+    address_governorate_id: row.address_governorate_id ?? null,
+    address_center_id: row.address_center_id ?? null,
+    address_area_id: row.address_area_id ?? null,
+    address_area_name: resolvedAddressArea?.name_ar || resolvedAddressArea?.name || null,
     delivery_notes: parsedNotes.cleanCustomerNotes,
     raw_customer_notes: row.customer_notes || null,
     items_diagnostic_message: itemsDiagnosticMessage,
@@ -1078,7 +1084,7 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
           continue;
         }
         const hasCentralOrderIds = Boolean(
-          row.delivery_area_id || row.delivery_center_id || row.delivery_governorate_id
+          row.address_area_id || row.address_center_id || row.address_governorate_id
         );
         if (hasCentralOrderIds && driver) {
           const matchRes = evaluateCentralCoverageMatch(row, driver, effectiveGeoContext);
@@ -1115,7 +1121,12 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
       row.pharmacy_order_files = filesList;
       row.pharmacy_order_pharmacy_stops = stopsList;
 
-      const mapped = mapSupabaseOrderToPharmacyOrder(row);
+      const mapped = mapSupabaseOrderToPharmacyOrder(
+        row,
+        undefined,
+        null,
+        effectiveGeoContext?.areas
+      );
       resultList.push(mapped);
     }
 

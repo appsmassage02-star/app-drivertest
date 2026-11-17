@@ -139,12 +139,10 @@ export interface PharmacyOrder {
   detailed_address: string;
   address_latitude?: number | null;
   address_longitude?: number | null;
-  delivery_governorate_id?: string | null;
-  delivery_center_id?: string | null;
-  delivery_area_id?: string | null;
-  delivery_area_name?: string | null;
-  delivery_latitude?: number | null;
-  delivery_longitude?: number | null;
+  address_governorate_id?: string | null;
+  address_center_id?: string | null;
+  address_area_id?: string | null;
+  address_area_name?: string | null;
   delivery_notes: string | null;
   raw_customer_notes?: string | null;
   items_diagnostic_message?: string | null;

@@ -92,7 +92,7 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
   // Customer details
   const customerName = order.customer_name || order.customer?.name || 'العميل';
   const customerAreaLabel =
-    order.delivery_area_name ||
+    (orderType === 'pharmacy' ? order.address_area_name : order.delivery_area_name) ||
     [order.governorate_name || order.governorate, order.markaz_name || order.center]
       .filter(Boolean)
       .join(' - ') ||

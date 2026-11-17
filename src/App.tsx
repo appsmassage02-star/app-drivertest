@@ -4344,8 +4344,12 @@ export default function App() {
                   </div>
                 ) : (
                   <p className="text-amber-800 text-[11px] font-semibold">
-                    {centralGeoContext.coverageError ||
-                      'لا توجد مناطق تغطية مركزية نشطة مسجلة لهذا السائق حاليًا (لن تظهر طلبات جديدة حتى تُسجل التغطية في النظام).'}
+                    {centralGeoContext.coverageFailedOperation
+                      ? `تعذر قراءة جدول ${centralGeoContext.coverageFailedOperation.table} (${centralGeoContext.coverageFailedOperation.operation}${
+                          centralGeoContext.coverageFailedOperation.isRls ? ' - RLS' : ''
+                        }): ${centralGeoContext.coverageFailedOperation.message}`
+                      : centralGeoContext.coverageError ||
+                        'لا توجد مناطق تغطية مركزية نشطة مسجلة لهذا السائق حاليًا (لن تظهر طلبات جديدة حتى تُسجل التغطية في النظام).'}
                   </p>
                 )}
               </div>

@@ -118,12 +118,9 @@ export interface SupabasePharmacyOrderRow {
   address_text: string;
   address_latitude?: number;
   address_longitude?: number;
-  delivery_governorate_id?: string | null;
-  delivery_center_id?: string | null;
-  delivery_area_id?: string | null;
-  delivery_area_name?: string | null;
-  delivery_latitude?: number | null;
-  delivery_longitude?: number | null;
+  address_governorate_id?: string | null;
+  address_center_id?: string | null;
+  address_area_id?: string | null;
   customer_notes?: string;
   medicines_total?: number;
   delivery_fee: number | null;
@@ -317,10 +314,18 @@ export interface GeoArea {
   is_active: boolean;
 }
 
+export interface DbFailedOperation {
+  table: string;
+  operation: 'SELECT' | 'INSERT' | 'UPSERT' | 'UPDATE' | 'DELETE';
+  errorType: 'permission_denied' | 'table_missing' | 'error';
+  isRls: boolean;
+  code?: string | null;
+  message: string;
+}
+
 export interface DriverAreaCoverageRow {
   id: string;
   driver_id: string;
-  restaurant_driver_id?: string | null;
   restaurant_id?: string | null;
   governorate_id?: string | null;
   center_id?: string | null;
@@ -341,6 +346,7 @@ export interface CentralGeoContext {
   coverageRows: DriverAreaCoverageRow[];
   coverageLoadState: 'idle' | 'loaded' | 'empty' | 'permission_denied' | 'table_missing' | 'error';
   coverageError?: string | null;
+  coverageFailedOperation?: DbFailedOperation | null;
 }
 
 export interface DeliverySystemSettings {
@@ -349,18 +355,19 @@ export interface DeliverySystemSettings {
   load_state: 'idle' | 'loaded' | 'empty' | 'permission_denied' | 'table_missing' | 'error';
   raw_record?: Record<string, any> | null;
   error_message?: string | null;
+  failedOperation?: DbFailedOperation | null;
 }
 
 export interface DriverLocationRecord {
   driver_id: string;
   latitude: number;
   longitude: number;
-  accuracy: number;
+  accuracy_m: number;
   recorded_at: string;
   source: string;
-  is_mock: boolean | null;
-  speed?: number | null;
-  heading?: number | null;
+  is_mocked: boolean | null;
+  speed_mps?: number | null;
+  heading_degrees?: number | null;
   altitude?: number | null;
   order_id?: string | null;
 }
@@ -546,6 +553,10 @@ export interface DeliveryOrder {
   delivery_center_id?: string | null;
   delivery_area_id?: string | null;
   delivery_area_name?: string | null;
+  address_governorate_id?: string | null;
+  address_center_id?: string | null;
+  address_area_id?: string | null;
+  address_area_name?: string | null;
   delivery_latitude?: number | null;
   delivery_longitude?: number | null;
   address_latitude?: number | null;
