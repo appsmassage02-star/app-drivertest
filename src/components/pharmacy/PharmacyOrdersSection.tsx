@@ -6,6 +6,7 @@ import { PharmacyOrderCard } from './PharmacyOrderCard';
 import { PharmacyOrderDetailsModal } from './PharmacyOrderDetailsModal';
 import { PharmacyCancellationModal } from './PharmacyCancellationModal';
 import type { DeliveryDriver } from '../../App';
+import type { CentralGeoContext } from '../../types';
 
 interface PharmacyOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
@@ -13,6 +14,7 @@ interface PharmacyOrdersSectionProps {
   currentDriver: DeliveryDriver | null;
   isWorking?: boolean;
   deliveryEnabled: boolean;
+  geoContext?: CentralGeoContext | null;
   pharmacyOrders: PharmacyOrder[];
   selectedPharmacyOrder: PharmacyOrder | null;
   isPharmacyLoading: boolean;
@@ -65,6 +67,7 @@ interface PharmacyOrdersSectionProps {
     reasonText: string
   ) => Promise<boolean>;
   onCallCustomer: (phone: string) => void;
+  onOpenMap?: (order: PharmacyOrder) => void;
 }
 
 export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
@@ -73,6 +76,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   currentDriver,
   isWorking = true,
   deliveryEnabled,
+  geoContext = null,
   pharmacyOrders,
   selectedPharmacyOrder,
   isPharmacyLoading,
@@ -96,6 +100,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   onCompleteDelivery,
   onRequestCancellation,
   onCallCustomer,
+  onOpenMap,
 }) => {
   const [cancellationTargetOrder, setCancellationTargetOrder] = useState<PharmacyOrder | null>(null);
 
@@ -103,11 +108,20 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
     let list = [...pharmacyOrders];
 
     if (activeTab === 'pending') {
-      list = list.filter(
-        (o) =>
-          o.status === 'pending_review' &&
-          isPharmacyOrderMatchingDriverTerritory(o, currentDriver)
-      );
+      const canSeePending =
+        Boolean(isWorking) &&
+        Boolean(deliveryEnabled) &&
+        currentDriver?.status === 'approved' &&
+        Boolean(currentDriver?.is_active);
+
+      list = canSeePending
+        ? list.filter(
+            (o) =>
+              o.status === 'pending_review' &&
+              !o.assigned_driver_id &&
+              isPharmacyOrderMatchingDriverTerritory(o, currentDriver, geoContext)
+          )
+        : [];
     } else if (activeTab === 'accepted') {
       list = list.filter(
         (o) =>
@@ -117,13 +131,16 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
           o.assigned_driver_id === currentDriver?.id
       );
     } else if (activeTab === 'completed') {
-      list = list.filter((o) => o.status === 'completed');
+      list = list.filter(
+        (o) => o.status === 'completed' && (!o.assigned_driver_id || o.assigned_driver_id === currentDriver?.id)
+      );
     } else if (activeTab === 'cancelled') {
       list = list.filter(
         (o) =>
-          o.status === 'cancelled' ||
-          o.status === 'unable_to_fulfill' ||
-          Boolean(o.cancellation_request)
+          (o.status === 'cancelled' ||
+            o.status === 'unable_to_fulfill' ||
+            Boolean(o.cancellation_request)) &&
+          (!o.assigned_driver_id || o.assigned_driver_id === currentDriver?.id)
       );
     } else {
       return [];
@@ -142,7 +159,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
     }
 
     return list;
-  }, [pharmacyOrders, activeTab, currentDriver, searchQuery]);
+  }, [pharmacyOrders, activeTab, currentDriver, isWorking, deliveryEnabled, geoContext, searchQuery]);
 
   if (!['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab)) {
     return null;
@@ -285,6 +302,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
               onCompleteDelivery={onCompleteDelivery}
               onRequestCancellation={(ord) => setCancellationTargetOrder(ord)}
               onCallCustomer={onCallCustomer}
+              onOpenMap={onOpenMap}
             />
           ))}
         </div>
@@ -312,6 +330,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
         onCompleteDelivery={onCompleteDelivery}
         onOpenCancellationModal={(ord) => setCancellationTargetOrder(ord)}
         onCallCustomer={onCallCustomer}
+        onOpenMap={onOpenMap}
       />
 
       {/* Pharmacy Request Cancellation Modal */}

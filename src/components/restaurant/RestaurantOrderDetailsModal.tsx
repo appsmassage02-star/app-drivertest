@@ -15,7 +15,10 @@ import {
   CheckSquare,
 } from 'lucide-react';
 import { DeliveryOrder } from '../../types';
-import { getRestaurantStatusBadge } from '../../lib/restaurantService';
+import {
+  getRestaurantStatusBadge,
+  computeRestaurantFinancials,
+} from '../../lib/restaurantService';
 import { formatSafeDateTime } from '../../App';
 
 interface RestaurantOrderDetailsModalProps {
@@ -37,6 +40,7 @@ interface RestaurantOrderDetailsModalProps {
   onCompleteOrder: (order: DeliveryOrder) => void;
   onOpenCancellationModal: (order: DeliveryOrder) => void;
   onCallPhone: (phone: string) => void;
+  onOpenMap?: (order: DeliveryOrder) => void;
 }
 
 export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalProps> = ({
@@ -53,6 +57,7 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
   onCompleteOrder,
   onOpenCancellationModal,
   onCallPhone,
+  onOpenMap,
 }) => {
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [itemPriceInput, setItemPriceInput] = useState<string>('');
@@ -81,20 +86,22 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
 
   const customerName = order.customer?.name || order.customer_name || 'عميل طلباتي';
   const customerPhone = order.customer?.phone || order.customer_phone || order.phone_number;
+  const customerAreaLabel = order.delivery_area_name || order.markaz_name || order.governorate_name || null;
   const customerAddress =
     order.customer?.address ||
     order.detailed_address ||
     order.customer?.area ||
     'عنوان العميل المسجل';
 
-  const totalAmount = Number(
-    order.actual_total_amount && order.actual_total_amount > 0
-      ? order.actual_total_amount
-      : order.total_amount || order.total || 0
-  );
-
-  const subtotal = Number(order.subtotal || (totalAmount > 15 ? totalAmount - 15 : totalAmount));
-  const deliveryFee = Number(order.delivery_fee || order.deliveryFee || 15);
+  const {
+    subtotal,
+    deliveryFee,
+    deliveryBaseFee,
+    deliveryAdminCommission,
+    deliveryDriverNet,
+    customerDeliveryFee,
+    totalAmount,
+  } = computeRestaurantFinancials(order);
   const items = order.items || [];
 
   return (
@@ -149,6 +156,21 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
             </div>
           )}
 
+          {/* Backend RPC Compatibility Guardrail Notice */}
+          {(order as any).restaurant_rpc_verified !== true && (
+            <div className="p-3.5 bg-orange-50 border border-orange-300 rounded-2xl flex items-start space-x-3 space-x-reverse text-orange-950">
+              <AlertTriangle className="w-5 h-5 text-orange-700 shrink-0 mt-0.5" />
+              <div className="text-xs leading-relaxed">
+                <strong className="block font-extrabold text-orange-950 mb-0.5">
+                  ملاحظة التوافق الخادمي لطلبات المطاعم (RPC Compatibility Blocker)
+                </strong>
+                <span>
+                  يتم إيقاف تنفيذ دوال تغيير الحالة (accept / shopping / delivery) على طلبات المطاعم مؤقتًا لحين إتمام التحقق المستقل على قاعدة بيانات Supabase من توافق دوال الطلبات المنزلية مع أعمدة وعناصر طلبات المطاعم. يمكنك عرض التفاصيل وفتح الخرائط والملاحة دون أي قيود.
+                </span>
+              </div>
+            </div>
+          )}
+
           {/* Status & Cash Collection Header */}
           <div className="bg-orange-50/60 p-4 rounded-2xl border border-orange-200 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center space-x-2.5 space-x-reverse">
@@ -163,7 +185,9 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
             <div className="inline-flex items-center space-x-2 space-x-reverse bg-emerald-600 text-white px-3.5 py-1.5 rounded-xl text-xs font-extrabold shadow-2xs">
               <Banknote className="w-4 h-4 text-emerald-200" />
               <span>المطلوب تحصيله كاش (COD):</span>
-              <span className="font-mono text-sm">{totalAmount.toFixed(2)} ج.م</span>
+              <span className="font-mono text-sm">
+                {totalAmount !== null ? `${totalAmount.toFixed(2)} ج.م` : 'البيانات المالية غير مكتملة'}
+              </span>
             </div>
           </div>
 
@@ -226,6 +250,11 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
               </div>
               <div>
                 <span className="text-neutral-500 font-bold block mb-0.5">العنوان التفصيلي:</span>
+                {customerAreaLabel && (
+                  <span className="inline-block text-[11px] font-bold text-orange-900 bg-orange-50 px-2 py-0.5 rounded-md border border-orange-200 mb-1">
+                    {customerAreaLabel}
+                  </span>
+                )}
                 <span className="text-neutral-800 flex items-start space-x-1 space-x-reverse">
                   <MapPin className="w-3.5 h-3.5 text-rose-600 shrink-0 mt-0.5" />
                   <span>{customerAddress}</span>
@@ -426,15 +455,51 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
             <div className="space-y-1.5 text-xs">
               <div className="flex justify-between text-neutral-700">
                 <span>إجمالي وجبات المطعم:</span>
-                <span className="font-mono font-bold">{subtotal.toFixed(2)} ج.م</span>
+                <span className="font-mono font-bold">
+                  {subtotal !== null ? `${subtotal.toFixed(2)} ج.م` : 'غير متوفر'}
+                </span>
               </div>
               <div className="flex justify-between text-neutral-700">
-                <span>رسوم التوصيل المعتمدة:</span>
-                <span className="font-mono font-bold">{deliveryFee.toFixed(2)} ج.م</span>
+                <span>رسوم التوصيل المسجلة:</span>
+                <span className="font-mono font-bold">
+                  {deliveryFee !== null ? `${deliveryFee.toFixed(2)} ج.م` : 'البيانات المالية غير مكتملة'}
+                </span>
+              </div>
+              {deliveryBaseFee !== null && (
+                <div className="flex justify-between text-neutral-600">
+                  <span>الرسوم الأساسية للتوصيل:</span>
+                  <span className="font-mono font-semibold">{deliveryBaseFee.toFixed(2)} ج.م</span>
+                </div>
+              )}
+              {customerDeliveryFee !== null && (
+                <div className="flex justify-between text-neutral-600">
+                  <span>رسوم التوصيل على العميل:</span>
+                  <span className="font-mono font-semibold">{customerDeliveryFee.toFixed(2)} ج.م</span>
+                </div>
+              )}
+              <div className="flex justify-between text-neutral-700">
+                <span>عمولة الإدارة المسجلة:</span>
+                <span className="font-mono font-semibold">
+                  {deliveryAdminCommission !== null
+                    ? `${deliveryAdminCommission.toFixed(2)} ج.م`
+                    : 'البيانات المالية غير مكتملة'}
+                </span>
+              </div>
+              <div className="flex justify-between text-emerald-900 font-bold bg-emerald-50/70 px-2 py-1 rounded-lg border border-emerald-200">
+                <span>صافي مستحقات السائق:</span>
+                <span className="font-mono">
+                  {deliveryDriverNet !== null
+                    ? `${deliveryDriverNet.toFixed(2)} ج.م`
+                    : 'البيانات المالية غير مكتملة'}
+                </span>
               </div>
               <div className="flex justify-between text-amber-950 pt-2 border-t border-amber-300 font-extrabold text-sm">
                 <span>المبلغ المطلوب تحصيله من العميل نقداً:</span>
-                <span className="font-mono text-base text-amber-900">{totalAmount.toFixed(2)} ج.م</span>
+                <span className="font-mono text-base text-amber-900">
+                  {totalAmount !== null
+                    ? `${totalAmount.toFixed(2)} ج.م`
+                    : 'البيانات المالية غير مكتملة'}
+                </span>
               </div>
             </div>
           </div>
@@ -443,6 +508,18 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
         {/* Modal Action Footer */}
         <div className="p-4 bg-neutral-50 border-t border-neutral-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
           <div className="flex items-center space-x-2 space-x-reverse">
+            {onOpenMap && (
+              <button
+                type="button"
+                onClick={() => onOpenMap(order)}
+                className="px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
+                title="فتح شاشة الخرائط وملاحة الـ GPS"
+              >
+                <MapPin className="w-3.5 h-3.5 text-emerald-700" />
+                <span>الخريطة والملاحة</span>
+              </button>
+            )}
+
             {isAssignedToMe &&
               (order.status === 'accepted' ||
                 order.status === 'shopping' ||
@@ -460,7 +537,7 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
 
           <div className="flex items-center space-x-2 space-x-reverse">
             {/* Accept Order Button */}
-            {(order.status === 'pending_review' || order.status === 'new') && (
+            {order.status === 'pending_review' && (
               <button
                 type="button"
                 disabled={!canAccept || isActionLoading}

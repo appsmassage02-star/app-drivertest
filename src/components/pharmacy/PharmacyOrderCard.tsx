@@ -26,6 +26,7 @@ interface PharmacyOrderCardProps {
   onCompleteDelivery: (orderId: string) => void;
   onRequestCancellation: (order: PharmacyOrder) => void;
   onCallCustomer: (phone: string) => void;
+  onOpenMap?: (order: PharmacyOrder) => void;
 }
 
 export function getPharmacyStatusBadge(status: PharmacyOrderStatus) {
@@ -81,6 +82,7 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
   onCompleteDelivery,
   onRequestCancellation,
   onCallCustomer,
+  onOpenMap,
 }) => {
   const isAssignedToCurrent = order.assigned_driver_id === currentDriverId;
   const statusBadge = getPharmacyStatusBadge(order.status);
@@ -155,7 +157,8 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
             <MapPin className="w-3.5 h-3.5 text-rose-500 shrink-0 mt-0.5" />
             <span>
               <strong>
-                {order.governorate_name} - {order.markaz_name}:
+                {order.governorate_name} - {order.markaz_name}
+                {order.delivery_area_name ? ` - ${order.delivery_area_name}` : ''}:
               </strong>{' '}
               {order.detailed_address}
             </span>
@@ -262,10 +265,18 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
         )}
 
         {/* Totals Bar (Rule 8: Only medicines_total + delivery_fee) */}
-        <div className="pt-2 border-t border-neutral-100 flex items-center justify-between text-xs">
+        <div className="pt-2 border-t border-neutral-100 flex items-center justify-between text-xs gap-2 flex-wrap">
           <span className="text-neutral-500">
-            رسوم التوصيل: {Number(order.totals.delivery_fee).toFixed(2)} ج.م
+            رسوم التوصيل:{' '}
+            {order.totals.delivery_fee != null
+              ? `${Number(order.totals.delivery_fee).toFixed(2)} ج.م`
+              : 'غير محدد (البيانات المالية غير مكتملة)'}
           </span>
+          {order.totals.delivery_driver_net != null && (
+            <span className="text-emerald-700 font-bold">
+              صافي السائق: {Number(order.totals.delivery_driver_net).toFixed(2)} ج.م
+            </span>
+          )}
           <span className="font-bold text-sm text-neutral-900">
             {order.totals.final_total != null ? (
               <>
@@ -285,16 +296,30 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
 
       {/* Card Footer Actions */}
       <div className="bg-neutral-50 px-5 py-3 border-t border-neutral-200 flex flex-wrap items-center justify-between gap-2">
-        <button
-          type="button"
-          onClick={() => onOpenDetails(order)}
-          className="text-xs font-bold text-teal-800 hover:text-teal-950 active:scale-95 transition flex items-center space-x-1 space-x-reverse cursor-pointer"
-        >
-          <Eye className="w-3.5 h-3.5" />
-          <span>
-            {order.status === 'shopping' ? 'تجهيز الأدوية والروشتة' : 'تفاصيل فاتورة الصيدلية'}
-          </span>
-        </button>
+        <div className="flex items-center space-x-2 space-x-reverse">
+          <button
+            type="button"
+            onClick={() => onOpenDetails(order)}
+            className="text-xs font-bold text-teal-800 hover:text-teal-950 active:scale-95 transition flex items-center space-x-1 space-x-reverse cursor-pointer"
+          >
+            <Eye className="w-3.5 h-3.5" />
+            <span>
+              {order.status === 'shopping' ? 'تجهيز الأدوية' : 'تفاصيل الفاتورة'}
+            </span>
+          </button>
+
+          {onOpenMap && (
+            <button
+              type="button"
+              onClick={() => onOpenMap(order)}
+              className="px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center space-x-1 space-x-reverse cursor-pointer shadow-2xs"
+              title="عرض الخريطة وملاحة الـ GPS"
+            >
+              <MapPin className="w-3.5 h-3.5 text-emerald-700" />
+              <span>الخريطة والملاحة</span>
+            </button>
+          )}
+        </div>
 
         <div className="flex items-center space-x-2 space-x-reverse flex-wrap gap-1">
           {/* Call Customer Button */}

@@ -27,7 +27,7 @@ export interface SupabaseDeliveryOrderRow {
   markaz_name: string;
   detailed_address: string;
   subtotal: number;
-  delivery_fee: number;
+  delivery_fee: number | null;
   total_amount: number;
   delivery_notes?: string;
   assigned_driver_id?: string; // uuid
@@ -52,6 +52,35 @@ export interface SupabaseDeliveryOrderRow {
   source_recurring_request_id?: string;
   actual_items_total: number;
   actual_total_amount: number;
+  // Central Geographic & Real Coordinate Columns
+  delivery_governorate_id?: string | null;
+  delivery_center_id?: string | null;
+  delivery_area_id?: string | null;
+  delivery_area_name?: string | null;
+  delivery_latitude?: number | null;
+  delivery_longitude?: number | null;
+  address_latitude?: number | null;
+  address_longitude?: number | null;
+  restaurant_latitude?: number | null;
+  restaurant_longitude?: number | null;
+  pickup_latitude?: number | null;
+  pickup_longitude?: number | null;
+  // Authoritative Delivery Financial Fields (Read-Only from Backend)
+  delivery_base_fee?: number | null;
+  delivery_admin_commission?: number | null;
+  delivery_driver_net?: number | null;
+  customer_delivery_fee?: number | null;
+  // Restaurant routing fields
+  restaurant_id?: string | null;
+  restaurant_name?: string | null;
+  restaurant_phone?: string | null;
+  delivery_by?: string | null;
+  delivered_by?: string | null;
+  delivery_type?: string | null;
+  delivery_provider?: string | null;
+  fulfillment_type?: string | null;
+  is_restaurant_delivery?: boolean | null;
+  is_talabaty_delivery?: boolean | null;
 }
 
 export interface SupabaseDeliveryOrderItemRow {
@@ -89,9 +118,19 @@ export interface SupabasePharmacyOrderRow {
   address_text: string;
   address_latitude?: number;
   address_longitude?: number;
+  delivery_governorate_id?: string | null;
+  delivery_center_id?: string | null;
+  delivery_area_id?: string | null;
+  delivery_area_name?: string | null;
+  delivery_latitude?: number | null;
+  delivery_longitude?: number | null;
   customer_notes?: string;
   medicines_total?: number;
-  delivery_fee: number;
+  delivery_fee: number | null;
+  delivery_base_fee?: number | null;
+  delivery_admin_commission?: number | null;
+  delivery_driver_net?: number | null;
+  customer_delivery_fee?: number | null;
   grand_total?: number;
   accepted_at?: string;
   shopping_started_at?: string;
@@ -173,6 +212,8 @@ export interface SupabasePharmacyDeliveryOrderRow {
   updated_at: string;
 }
 
+export type DriverAffiliation = 'platform' | 'restaurant_staff';
+
 export interface SupabaseDeliveryDriverRow {
   id: string; // uuid
   user_id?: string; // uuid
@@ -182,10 +223,17 @@ export interface SupabaseDeliveryDriverRow {
   vehicle_type?: string; // default 'motorcycle'
   notes?: string;
   role?: string; // default 'delivery_driver'
+  driver_type?: string | null;
+  driver_category?: string | null;
+  employment_type?: string | null;
+  restaurant_id?: string | null;
   status: string; // default 'pending_approval'
   governorate_name?: string;
   governorate_code?: string;
   markaz_name?: string;
+  governorate_id?: string | null;
+  center_id?: string | null;
+  area_id?: string | null;
   vehicle_plate?: string;
   national_id?: string;
   approved_at?: string;
@@ -211,12 +259,20 @@ export interface DeliveryDriver {
   is_active: boolean;
   vehicle_type: string | null;
   notes: string | null;
+  role?: string | null;
+  driver_type?: string | null;
+  driver_category?: string | null;
+  employment_type?: string | null;
+  restaurant_id?: string | null;
   created_at: string;
   updated_at: string;
   status: DriverStatus;
   governorate_name: string | null;
   governorate_code: string | null;
   markaz_name: string | null;
+  governorate_id?: string | null;
+  center_id?: string | null;
+  area_id?: string | null;
   vehicle_plate: string | null;
   national_id: string | null;
   approved_at: string | null;
@@ -230,6 +286,96 @@ export interface DeliveryDriver {
   vehicle_license_path?: string | null;
   is_available_for_work?: boolean;
   availability_last_seen_at?: string | null;
+}
+
+// --- Central Geographic & Coverage & Tracking Interfaces ---
+
+export interface GeoGovernorate {
+  id: string;
+  name: string;
+  name_ar?: string | null;
+  code?: string | null;
+  is_active: boolean;
+}
+
+export interface GeoCenter {
+  id: string;
+  governorate_id: string | null;
+  name: string;
+  name_ar?: string | null;
+  code?: string | null;
+  is_active: boolean;
+}
+
+export interface GeoArea {
+  id: string;
+  governorate_id: string | null;
+  center_id: string | null;
+  name: string;
+  name_ar?: string | null;
+  code?: string | null;
+  is_active: boolean;
+}
+
+export interface DriverAreaCoverageRow {
+  id: string;
+  driver_id: string;
+  restaurant_driver_id?: string | null;
+  restaurant_id?: string | null;
+  governorate_id?: string | null;
+  center_id?: string | null;
+  area_id?: string | null;
+  service_type?: string | null; // e.g. 'regular' | 'restaurant' | 'pharmacy' | 'all' | null
+  is_active: boolean;
+  status?: string | null;
+  source_table: 'delivery_driver_area_coverage' | 'restaurant_driver_area_coverage';
+}
+
+export interface CentralGeoContext {
+  governorates: GeoGovernorate[];
+  centers: GeoCenter[];
+  areas: GeoArea[];
+  geoLoadState: 'idle' | 'loaded' | 'permission_denied' | 'table_missing' | 'error';
+  geoError?: string | null;
+  driverAffiliation: DriverAffiliation;
+  coverageRows: DriverAreaCoverageRow[];
+  coverageLoadState: 'idle' | 'loaded' | 'empty' | 'permission_denied' | 'table_missing' | 'error';
+  coverageError?: string | null;
+}
+
+export interface DeliverySystemSettings {
+  driver_tracking_enabled: boolean | null;
+  max_accepted_gps_accuracy_m: number | null;
+  load_state: 'idle' | 'loaded' | 'empty' | 'permission_denied' | 'table_missing' | 'error';
+  raw_record?: Record<string, any> | null;
+  error_message?: string | null;
+}
+
+export interface DriverLocationRecord {
+  driver_id: string;
+  latitude: number;
+  longitude: number;
+  accuracy: number;
+  recorded_at: string;
+  source: string;
+  is_mock: boolean | null;
+  speed?: number | null;
+  heading?: number | null;
+  altitude?: number | null;
+  order_id?: string | null;
+}
+
+export interface OrderFinancialBreakdown {
+  subtotal: number | null;
+  actualItemsTotal: number | null;
+  deliveryFee: number | null;
+  deliveryBaseFee: number | null;
+  deliveryAdminCommission: number | null;
+  deliveryDriverNet: number | null;
+  customerDeliveryFee: number | null;
+  totalAmount: number | null;
+  actualTotalAmount: number | null;
+  hasIncompleteFinancials: boolean;
 }
 
 export interface SupabaseDeliveryOrderStatusHistoryRow {
@@ -376,11 +522,11 @@ export interface DeliveryOrder {
   };
   items: OrderItem[];
   itemsCount: number;
-  subtotal: number;
-  deliveryFee: number;
+  subtotal: number | null;
+  deliveryFee: number | null;
   discount: number;
-  total: number;
-  driverFee: number;
+  total: number | null;
+  driverFee: number | null;
   paymentMethod: PaymentMethod;
   isPaid: boolean;
   distanceKm: number;
@@ -395,13 +541,31 @@ export interface DeliveryOrder {
   cancellation_requested_at?: string;
   cancellation_decision_note?: string;
   cancellation_decided_at?: string;
-  // Raw table column mirrors for backwards compatibility with legacy UI components
+  // Central Geographic & Real Coordinate Fields
+  delivery_governorate_id?: string | null;
+  delivery_center_id?: string | null;
+  delivery_area_id?: string | null;
+  delivery_area_name?: string | null;
+  delivery_latitude?: number | null;
+  delivery_longitude?: number | null;
+  address_latitude?: number | null;
+  address_longitude?: number | null;
+  restaurant_latitude?: number | null;
+  restaurant_longitude?: number | null;
+  pickup_latitude?: number | null;
+  pickup_longitude?: number | null;
+  // Raw table column mirrors & Authoritative Stored Delivery Financials
   customer_name?: string;
   customer_phone?: string;
   phone_number?: string;
   detailed_address?: string;
   order_number?: string;
-  total_amount?: number;
+  total_amount?: number | null;
+  delivery_fee?: number | null;
+  delivery_base_fee?: number | null;
+  delivery_admin_commission?: number | null;
+  delivery_driver_net?: number | null;
+  customer_delivery_fee?: number | null;
   delivery_notes?: string;
   household_id?: string;
   created_at?: string;
@@ -419,6 +583,7 @@ export interface DeliveryOrder {
   delivery_by?: string;
   delivered_by?: string;
   is_restaurant_delivery?: boolean;
+  is_talabaty_delivery?: boolean;
 }
 
 export interface PharmacyOrder extends DeliveryOrder {

@@ -112,8 +112,12 @@ export interface PharmacyCancellationRequest {
 
 export interface PharmacyOrderTotals {
   medicines_total: number | null;
-  delivery_fee: number;
+  delivery_fee: number | null;
   final_total: number | null;
+  delivery_base_fee?: number | null;
+  delivery_admin_commission?: number | null;
+  delivery_driver_net?: number | null;
+  customer_delivery_fee?: number | null;
 }
 
 export type PharmacyCompensationStatus =
@@ -133,6 +137,14 @@ export interface PharmacyOrder {
   governorate_code?: string | null;
   markaz_name: string;
   detailed_address: string;
+  address_latitude?: number | null;
+  address_longitude?: number | null;
+  delivery_governorate_id?: string | null;
+  delivery_center_id?: string | null;
+  delivery_area_id?: string | null;
+  delivery_area_name?: string | null;
+  delivery_latitude?: number | null;
+  delivery_longitude?: number | null;
   delivery_notes: string | null;
   raw_customer_notes?: string | null;
   items_diagnostic_message?: string | null;
@@ -143,6 +155,8 @@ export interface PharmacyOrder {
   requested_pharmacy_name: string | null;
   requested_pharmacy_address?: string | null;
   requested_pharmacy_phone?: string | null;
+  requested_pharmacy_latitude?: number | null;
+  requested_pharmacy_longitude?: number | null;
   pharmacy_selection_mode?: string | null;
 
   // Pharmacy change suggestion (when customer specified a pharmacy, driver can only suggest change)

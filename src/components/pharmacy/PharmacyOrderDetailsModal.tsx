@@ -83,6 +83,7 @@ interface PharmacyOrderDetailsModalProps {
   onCompleteDelivery: (orderId: string) => Promise<void>;
   onOpenCancellationModal: (order: PharmacyOrder) => void;
   onCallCustomer: (phone: string) => void;
+  onOpenMap?: (order: PharmacyOrder) => void;
 }
 
 const PRESET_SHORTAGE_REASONS = [
@@ -121,6 +122,7 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
   onCompleteDelivery,
   onOpenCancellationModal,
   onCallCustomer,
+  onOpenMap,
 }) => {
   // Active item resolution form state
   const [activeItemId, setActiveItemId] = useState<string | null>(null);
@@ -210,7 +212,9 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
       setMedicinesTotalInput(
         order.totals.medicines_total != null ? String(order.totals.medicines_total) : ''
       );
-      setDeliveryFeeInput(String(order.totals.delivery_fee ?? 0));
+      setDeliveryFeeInput(
+        order.totals.delivery_fee != null ? String(order.totals.delivery_fee) : ''
+      );
       setActiveItemId(null);
       setEditingNoteImageId(null);
       setShowSuggestionForm(false);
@@ -520,10 +524,19 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
                 <p className="text-teal-800 text-[11px] leading-relaxed">
                   الإجمالي المطلوب تحصيله من العميل:{' '}
                   <strong className="font-mono">
-                    {Number(order.totals.final_total || 0).toFixed(2)} ج.م
+                    {order.totals.final_total != null
+                      ? `${Number(order.totals.final_total).toFixed(2)} ج.م`
+                      : 'غير محدد'}
                   </strong>{' '}
-                  (إجمالي الأدوية {Number(order.totals.medicines_total || 0).toFixed(2)} ج.م + التوصيل{' '}
-                  {Number(order.totals.delivery_fee || 0).toFixed(2)} ج.م).
+                  (إجمالي الأدوية{' '}
+                  {order.totals.medicines_total != null
+                    ? `${Number(order.totals.medicines_total).toFixed(2)} ج.م`
+                    : 'غير محدد'}{' '}
+                  + التوصيل{' '}
+                  {order.totals.delivery_fee != null
+                    ? `${Number(order.totals.delivery_fee).toFixed(2)} ج.م`
+                    : 'غير محدد'}
+                  ).
                 </p>
               </div>
               {isAssignedToMe && (
@@ -602,6 +615,7 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
               </span>
               <div className="font-extrabold text-neutral-900">
                 {order.governorate_name} - {order.markaz_name}
+                {order.delivery_area_name ? ` - ${order.delivery_area_name}` : ''}
               </div>
               <div className="text-neutral-700 leading-relaxed">{order.detailed_address}</div>
               {order.delivery_notes ? (
@@ -1711,9 +1725,19 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
                     <div className="flex justify-between text-neutral-700">
                       <span>رسوم التوصيل:</span>
                       <span className="font-mono font-bold">
-                        {Number(order.totals.delivery_fee).toFixed(2)} ج.م
+                        {order.totals.delivery_fee != null
+                          ? `${Number(order.totals.delivery_fee).toFixed(2)} ج.م`
+                          : 'البيانات المالية غير مكتملة'}
                       </span>
                     </div>
+                    {order.totals.delivery_driver_net != null && (
+                      <div className="flex justify-between text-emerald-700 font-bold">
+                        <span>صافي السائق المخزن:</span>
+                        <span className="font-mono">
+                          {Number(order.totals.delivery_driver_net).toFixed(2)} ج.م
+                        </span>
+                      </div>
+                    )}
                     <div className="flex justify-between text-teal-950 pt-2 border-t border-teal-200 text-sm font-extrabold">
                       <span>الإجمالي النهائي (إجمالي الأدوية + رسوم التوصيل):</span>
                       <span className="font-mono text-base text-teal-800">
@@ -1794,6 +1818,18 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
               >
                 <Phone className="w-3.5 h-3.5" />
                 <span>اتصال بالعميل</span>
+              </button>
+            )}
+
+            {onOpenMap && (
+              <button
+                type="button"
+                onClick={() => onOpenMap(order)}
+                className="px-3.5 py-2 bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
+                title="فتح شاشة الخرائط وملاحة الـ GPS"
+              >
+                <MapPin className="w-3.5 h-3.5 text-teal-700" />
+                <span>الخريطة والملاحة</span>
               </button>
             )}
 

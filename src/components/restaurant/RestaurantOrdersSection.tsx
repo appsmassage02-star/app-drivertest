@@ -29,6 +29,7 @@ interface RestaurantOrdersSectionProps {
   onCompleteOrder: (order: DeliveryOrder) => void;
   onOpenCancellationModal: (order: DeliveryOrder) => void;
   onCallPhone: (phone: string) => void;
+  onOpenMap?: (order: DeliveryOrder) => void;
 }
 
 export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = ({
@@ -50,6 +51,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
   onCompleteOrder,
   onOpenCancellationModal,
   onCallPhone,
+  onOpenMap,
 }) => {
   if (!['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab)) {
     return null;
@@ -134,7 +136,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
               key={order.id}
               order={order}
               currentDriverId={currentDriver?.id}
-              canAccept={canAcceptBase && (order.status === 'pending_review' || order.status === 'new')}
+              canAccept={canAcceptBase && order.status === 'pending_review'}
               isWorking={isWorking}
               isActionLoading={isActionLoading}
               onOpenDetails={onSelectOrder}
@@ -143,6 +145,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
               onCompleteOrder={onCompleteOrder}
               onRequestCancellation={onOpenCancellationModal}
               onCallPhone={onCallPhone}
+              onOpenMap={onOpenMap}
             />
           ))}
         </div>
@@ -153,9 +156,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
         order={selectedRestaurantOrder}
         currentDriverId={currentDriver?.id}
         canAccept={
-          canAcceptBase &&
-          (selectedRestaurantOrder?.status === 'pending_review' ||
-            selectedRestaurantOrder?.status === 'new')
+          canAcceptBase && selectedRestaurantOrder?.status === 'pending_review'
         }
         isWorking={isWorking}
         isActionLoading={isActionLoading}
@@ -167,6 +168,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
         onCompleteOrder={onCompleteOrder}
         onOpenCancellationModal={onOpenCancellationModal}
         onCallPhone={onCallPhone}
+        onOpenMap={onOpenMap}
       />
     </div>
   );

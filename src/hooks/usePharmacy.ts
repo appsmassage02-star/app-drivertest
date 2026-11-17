@@ -12,15 +12,17 @@ import {
   enqueueOfflineAction,
 } from '../lib/offlineStore';
 import type { DeliveryDriver } from '../App';
+import type { CentralGeoContext } from '../types';
 
 interface UsePharmacyOptions {
   currentDriver: DeliveryDriver | null;
   isWorking?: boolean;
   deliveryEnabled: boolean;
+  geoContext?: CentralGeoContext | null;
   onToast?: (text: string, type?: 'success' | 'error' | 'info') => void;
 }
 
-export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled, onToast }: UsePharmacyOptions) {
+export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled, geoContext = null, onToast }: UsePharmacyOptions) {
   const [pharmacyOrders, setPharmacyOrders] = useState<PharmacyOrder[]>([]);
   const [selectedPharmacyOrder, setSelectedPharmacyOrder] = useState<PharmacyOrder | null>(null);
   const [isPharmacyLoading, setIsPharmacyLoading] = useState<boolean>(false);
@@ -40,11 +42,16 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
   const [lastCompensatorySyncSource, setLastCompensatorySyncSource] = useState<string | null>(null);
   const [pharmacyDiagnosticLogs, setPharmacyDiagnosticLogs] = useState<RealtimeDiagnosticLog[]>([]);
 
-  // Ref to always hold the freshest driver reference inside async callbacks and Realtime events
+  // Ref to always hold the freshest driver & geoContext references inside async callbacks and Realtime events
   const currentDriverRef = useRef<DeliveryDriver | null>(currentDriver);
   useEffect(() => {
     currentDriverRef.current = currentDriver;
   }, [currentDriver]);
+
+  const geoContextRef = useRef<CentralGeoContext | null>(geoContext);
+  useEffect(() => {
+    geoContextRef.current = geoContext;
+  }, [geoContext]);
 
   // Concurrency lock to prevent duplicate clicks or parallel acceptance of pharmacy orders
   const acceptingPharmacyOrderIdsRef = useRef<Set<string>>(new Set());
@@ -131,7 +138,7 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
     const driver = currentDriverRef.current;
     try {
       if (navigator.onLine) {
-        const data = await pharmacyService.getOrdersForDriver(driver);
+        const data = await pharmacyService.getOrdersForDriver(driver, geoContextRef.current);
         setPharmacyOrders((prev) => {
           // Detect if any new pending review order arrived in driver territory
           const prevIds = new Set(prev.map((o) => o.id));
@@ -874,13 +881,22 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
     [syncUpdatedOrderInState]
   );
 
-  // Counts by tab matching the regular orders tabs
+  // Counts by tab matching central eligibility rules
   const pharmacyCounts = useMemo(() => {
-    const pending = pharmacyOrders.filter(
-      (o) =>
-        o.status === 'pending_review' &&
-        isPharmacyOrderMatchingDriverTerritory(o, currentDriver)
-    ).length;
+    const canSeePending =
+      Boolean(isWorking) &&
+      Boolean(deliveryEnabled) &&
+      currentDriver?.status === 'approved' &&
+      Boolean(currentDriver?.is_active);
+
+    const pending = canSeePending
+      ? pharmacyOrders.filter(
+          (o) =>
+            o.status === 'pending_review' &&
+            !o.assigned_driver_id &&
+            isPharmacyOrderMatchingDriverTerritory(o, currentDriver, geoContext)
+        ).length
+      : 0;
 
     const accepted = pharmacyOrders.filter(
       (o) =>
@@ -890,13 +906,16 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
         o.assigned_driver_id === currentDriver?.id
     ).length;
 
-    const completed = pharmacyOrders.filter((o) => o.status === 'completed').length;
+    const completed = pharmacyOrders.filter(
+      (o) => o.status === 'completed' && (!o.assigned_driver_id || o.assigned_driver_id === currentDriver?.id)
+    ).length;
 
     const cancelled = pharmacyOrders.filter(
       (o) =>
-        o.status === 'cancelled' ||
-        o.status === 'unable_to_fulfill' ||
-        Boolean(o.cancellation_request)
+        (o.status === 'cancelled' ||
+          o.status === 'unable_to_fulfill' ||
+          Boolean(o.cancellation_request)) &&
+        (!o.assigned_driver_id || o.assigned_driver_id === currentDriver?.id)
     ).length;
 
     return {
@@ -906,7 +925,7 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
       cancelled,
       total: pharmacyOrders.length,
     };
-  }, [pharmacyOrders, currentDriver]);
+  }, [pharmacyOrders, currentDriver, isWorking, deliveryEnabled, geoContext]);
 
   return {
     pharmacyOrders,

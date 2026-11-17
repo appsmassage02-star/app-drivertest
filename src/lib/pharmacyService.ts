@@ -14,13 +14,19 @@ import {
   RegisteredPharmacy,
   PharmacyDirectoryQueryResult,
 } from '../types/pharmacy';
-import { normalizeArabicLocation, resolveGovernorate } from '../data/locationOrderMatcher';
+import { normalizeArabicLocation } from '../data/locationOrderMatcher';
 import { getClient, type DeliveryDriver } from '../App';
 import { dataUrlToBlob } from '../components/DocumentUploader';
 import { ordersService } from '../services/ordersService';
+import type { CentralGeoContext } from '../types';
+import {
+  evaluateCentralCoverageMatch,
+  loadFullCentralGeoContext,
+  resolveDriverAffiliation,
+} from './geoCoverageService';
 
 export interface IPharmacyRepository {
-  getOrdersForDriver(driver: DeliveryDriver | null): Promise<PharmacyOrder[]>;
+  getOrdersForDriver(driver: DeliveryDriver | null, geoContext?: CentralGeoContext | null): Promise<PharmacyOrder[]>;
   getOrderById(orderId: string): Promise<PharmacyOrder | null>;
   getActivePharmaciesForOrder(params?: {
     governorateName?: string | null;
@@ -223,18 +229,70 @@ export function parseStructuredCustomerNotes(rawNotes?: string | null): {
 }
 
 /**
- * Checks whether a PharmacyOrder matches the authenticated driver's territory
- * using the exact same Governorate + Markaz rules as regular delivery orders.
+ * Checks whether a PharmacyOrder matches the driver's territory:
+ * - Already assigned to this driver -> always true
+ * - Assigned to another driver -> always false
+ * - Restaurant staff drivers never receive platform pharmacy orders
+ * - If pharmacy order carries central geo IDs (delivery_area_id / delivery_center_id / delivery_governorate_id),
+ *   strictly uses central geo coverage matching.
+ * - Otherwise preserves legacy pharmacy matching cleanly (and checks active central coverage center names if loaded).
  */
 export function isPharmacyOrderMatchingDriverTerritory(
   order: PharmacyOrder,
-  driver: DeliveryDriver | null
+  driver: DeliveryDriver | null,
+  geoContext?: CentralGeoContext | null
 ): boolean {
   if (!driver) return false;
-  if (order.assigned_driver_id && order.assigned_driver_id === driver.id) {
-    return true;
+  if (order.assigned_driver_id) {
+    return order.assigned_driver_id === driver.id;
   }
 
+  if (resolveDriverAffiliation(driver) === 'restaurant_staff') {
+    return false;
+  }
+
+  const hasCentralOrderIds = Boolean(
+    order.delivery_area_id || order.delivery_center_id || order.delivery_governorate_id
+  );
+  if (hasCentralOrderIds) {
+    return evaluateCentralCoverageMatch(order, driver, geoContext).matched;
+  }
+
+  // If central coverage is loaded without geo IDs on pharmacy_orders, check resolved center/gov names first
+  if (geoContext && geoContext.coverageLoadState === 'loaded') {
+    const activeCov = geoContext.coverageRows.filter((c) => c.is_active);
+    if (activeCov.length === 0) return false;
+
+    const orderGovNorm = normalizeArabicLocation(order.governorate_name);
+    const orderMarkazNorm = normalizeArabicLocation(order.markaz_name);
+    if (orderGovNorm && orderMarkazNorm) {
+      for (const cov of activeCov) {
+        const covCenter = cov.center_id
+          ? geoContext.centers.find((c) => c.id === cov.center_id)
+          : cov.area_id
+          ? geoContext.centers.find(
+              (c) => c.id === geoContext.areas.find((a) => a.id === cov.area_id)?.center_id
+            )
+          : null;
+        const covGov = cov.governorate_id
+          ? geoContext.governorates.find((g) => g.id === cov.governorate_id)
+          : covCenter?.governorate_id
+          ? geoContext.governorates.find((g) => g.id === covCenter.governorate_id)
+          : null;
+
+        if (covCenter && normalizeArabicLocation(covCenter.name) === orderMarkazNorm) {
+          if (!covGov || normalizeArabicLocation(covGov.name) === orderGovNorm) {
+            return true;
+          }
+        } else if (!cov.center_id && !cov.area_id && covGov && normalizeArabicLocation(covGov.name) === orderGovNorm) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  // Legacy fallback strictly for pharmacy_orders lacking central IDs when central context isn't loaded
   const driverGov = (driver.governorate_name || '').trim();
   const driverGovCode = (driver.governorate_code || '').trim();
   const driverMarkaz = (driver.markaz_name || '').trim();
@@ -248,14 +306,8 @@ export function isPharmacyOrderMatchingDriverTerritory(
   const normDriverGov = normalizeArabicLocation(driverGov);
   const normOrderGov = normalizeArabicLocation(orderGov);
 
-  const resolvedDriverGov =
-    resolveGovernorate(driverGov) || (driverGovCode ? resolveGovernorate(driverGovCode) : null);
-  const resolvedOrderGov =
-    resolveGovernorate(orderGov) || (orderGovCode ? resolveGovernorate(orderGovCode) : null);
-
   const isGovMatch =
-    (normDriverGov && normOrderGov && normDriverGov === normOrderGov) ||
-    Boolean(resolvedDriverGov && resolvedOrderGov && resolvedDriverGov.code === resolvedOrderGov.code) ||
+    Boolean(normDriverGov && normOrderGov && normDriverGov === normOrderGov) ||
     Boolean(
       driverGovCode &&
         ((orderGovCode && orderGovCode.toUpperCase() === driverGovCode.toUpperCase()) ||
@@ -293,14 +345,9 @@ export function doesPharmacyMatchOrderArea(
     } else {
       const normPGov = normalizeArabicLocation(pGovName);
       const normOGov = normalizeArabicLocation(oGovName);
-      const resPGov =
-        resolveGovernorate(pGovName) || (pGovCode ? resolveGovernorate(pGovCode) : null);
-      const resOGov =
-        resolveGovernorate(oGovName) || (oGovCode ? resolveGovernorate(oGovCode) : null);
 
       govMatches =
         Boolean(normPGov && normOGov && normPGov === normOGov) ||
-        Boolean(resPGov && resOGov && resPGov.code === resOGov.code) ||
         Boolean(
           pGovCode &&
             oGovCode &&
@@ -691,17 +738,17 @@ function mapSupabaseOrderToPharmacyOrder(
     };
   }
 
-  // Totals: final_total = medicines_total + delivery_fee
+  // Totals: preserve stored fields without fake defaults
   const medicinesTotal =
     row.medicines_total !== null && row.medicines_total !== undefined
       ? Number(row.medicines_total)
       : null;
   const deliveryFee =
-    row.delivery_fee !== null && row.delivery_fee !== undefined ? Number(row.delivery_fee) : 0;
+    row.delivery_fee !== null && row.delivery_fee !== undefined ? Number(row.delivery_fee) : null;
   const finalTotal =
     row.grand_total !== null && row.grand_total !== undefined
       ? Number(row.grand_total)
-      : medicinesTotal !== null
+      : medicinesTotal !== null && deliveryFee !== null
       ? Number((medicinesTotal + deliveryFee).toFixed(2))
       : null;
 
@@ -748,6 +795,9 @@ function mapSupabaseOrderToPharmacyOrder(
     addressRow?.detailed_address ||
     '';
 
+  const deliveryLatRaw = row.delivery_latitude ?? row.address_latitude ?? addressRow?.latitude ?? null;
+  const deliveryLngRaw = row.delivery_longitude ?? row.address_longitude ?? addressRow?.longitude ?? null;
+
   return {
     id: String(row.id),
     order_number: String(row.order_number || `PH-${String(row.id).slice(0, 8).toUpperCase()}`),
@@ -759,6 +809,24 @@ function mapSupabaseOrderToPharmacyOrder(
     governorate_code: governorateCode,
     markaz_name: String(markazName),
     detailed_address: String(detailedAddress),
+    address_latitude:
+      row.address_latitude !== null && row.address_latitude !== undefined
+        ? Number(row.address_latitude)
+        : addressRow?.latitude !== null && addressRow?.latitude !== undefined
+        ? Number(addressRow.latitude)
+        : null,
+    address_longitude:
+      row.address_longitude !== null && row.address_longitude !== undefined
+        ? Number(row.address_longitude)
+        : addressRow?.longitude !== null && addressRow?.longitude !== undefined
+        ? Number(addressRow.longitude)
+        : null,
+    delivery_governorate_id: row.delivery_governorate_id ?? null,
+    delivery_center_id: row.delivery_center_id ?? null,
+    delivery_area_id: row.delivery_area_id ?? null,
+    delivery_area_name: row.delivery_area_name ?? null,
+    delivery_latitude: deliveryLatRaw !== null && deliveryLatRaw !== undefined ? Number(deliveryLatRaw) : null,
+    delivery_longitude: deliveryLngRaw !== null && deliveryLngRaw !== undefined ? Number(deliveryLngRaw) : null,
     delivery_notes: parsedNotes.cleanCustomerNotes,
     raw_customer_notes: row.customer_notes || null,
     items_diagnostic_message: itemsDiagnosticMessage,
@@ -767,6 +835,14 @@ function mapSupabaseOrderToPharmacyOrder(
     requested_pharmacy_name: requestedPharmacyName,
     requested_pharmacy_address: pharmacyRow?.address || null,
     requested_pharmacy_phone: pharmacyRow?.phone || null,
+    requested_pharmacy_latitude:
+      pharmacyRow?.latitude !== null && pharmacyRow?.latitude !== undefined
+        ? Number(pharmacyRow.latitude)
+        : null,
+    requested_pharmacy_longitude:
+      pharmacyRow?.longitude !== null && pharmacyRow?.longitude !== undefined
+        ? Number(pharmacyRow.longitude)
+        : null,
     pharmacy_selection_mode: row.pharmacy_selection_mode || null,
     pharmacy_change_suggestion: pharmacyChangeSuggestion,
     driver_visited_pharmacies: driverVisitedPharmacies,
@@ -776,6 +852,22 @@ function mapSupabaseOrderToPharmacyOrder(
       medicines_total: medicinesTotal,
       delivery_fee: deliveryFee,
       final_total: finalTotal,
+      delivery_base_fee:
+        row.delivery_base_fee !== null && row.delivery_base_fee !== undefined
+          ? Number(row.delivery_base_fee)
+          : null,
+      delivery_admin_commission:
+        row.delivery_admin_commission !== null && row.delivery_admin_commission !== undefined
+          ? Number(row.delivery_admin_commission)
+          : null,
+      delivery_driver_net:
+        row.delivery_driver_net !== null && row.delivery_driver_net !== undefined
+          ? Number(row.delivery_driver_net)
+          : null,
+      customer_delivery_fee:
+        row.customer_delivery_fee !== null && row.customer_delivery_fee !== undefined
+          ? Number(row.customer_delivery_fee)
+          : null,
     },
     receipt_image_url: receiptImageUrl,
     receipt_captured_at: receiptCapturedAt,
@@ -855,7 +947,10 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
     }
   }
 
-  async getOrdersForDriver(driver: DeliveryDriver | null): Promise<PharmacyOrder[]> {
+  async getOrdersForDriver(
+    driver: DeliveryDriver | null,
+    geoContextOverride?: CentralGeoContext | null
+  ): Promise<PharmacyOrder[]> {
     const supabase = this.getSupabaseOrThrow();
     const { data: ordersRows, error: phrError } = await supabase
       .from('pharmacy_orders')
@@ -949,6 +1044,9 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
       // ignore
     }
 
+    const effectiveGeoContext =
+      geoContextOverride || (driver ? await loadFullCentralGeoContext(supabase, driver) : null);
+
     const driverId = driver?.id ? String(driver.id) : null;
     const governorate = (driver?.governorate_name || (driver as any)?.governorate || '').trim();
     const center = (driver?.markaz_name || (driver as any)?.center || '').trim();
@@ -970,18 +1068,32 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
         continue;
       }
 
-      // 2. If unassigned, must be available and match zone if defined
+      // 2. If unassigned, check central geo IDs if explicitly present on pharmacy_orders;
+      // otherwise preserve existing pharmacy behavior cleanly
       if (!assignedDriverId) {
         if (row.status === 'completed' || row.status === 'cancelled' || row.status === 'delivered') {
           continue;
         }
-        const rowGov = (row.address_governorate_name || row.governorate_name || row.governorate || '').trim();
-        const rowMarkaz = (row.address_center_name || row.markaz_name || row.center || '').trim();
-        if (governorate && rowGov && rowGov !== governorate) {
+        if (driver && resolveDriverAffiliation(driver) === 'restaurant_staff') {
           continue;
         }
-        if (center && rowMarkaz && rowMarkaz !== center) {
-          continue;
+        const hasCentralOrderIds = Boolean(
+          row.delivery_area_id || row.delivery_center_id || row.delivery_governorate_id
+        );
+        if (hasCentralOrderIds && driver) {
+          const matchRes = evaluateCentralCoverageMatch(row, driver, effectiveGeoContext);
+          if (!matchRes.matched) {
+            continue;
+          }
+        } else {
+          const rowGov = (row.address_governorate_name || row.governorate_name || row.governorate || '').trim();
+          const rowMarkaz = (row.address_center_name || row.markaz_name || row.center || '').trim();
+          if (governorate && rowGov && rowGov !== governorate) {
+            continue;
+          }
+          if (center && rowMarkaz && rowMarkaz !== center) {
+            continue;
+          }
         }
       }
 
@@ -1611,43 +1723,63 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
       return currentOrder;
     }
 
-    let storagePath = receiptDataUrl;
+    let storagePath: string | null = null;
     const mimeType = 'image/webp';
 
-    // Upload binary WebP blob to the actual Supabase Storage bucket ('pharmacy' first)
-    try {
-      const blob = dataUrlToBlob(receiptDataUrl);
-      const fileName = `receipt_${orderId}_${Date.now()}.webp`;
-      const candidatePaths = [
-        `orders/${orderId}/receipts/${fileName}`,
-        `${orderId}/${fileName}`,
-        `receipts/${orderId}/${fileName}`,
-      ];
-      const bucketsToTry = ['pharmacy', 'driver-documents'];
+    // If receiptDataUrl is already a remote URL (and not base64/data URL), verify it
+    if (
+      (receiptDataUrl.startsWith('http://') || receiptDataUrl.startsWith('https://')) &&
+      !receiptDataUrl.startsWith('data:') &&
+      !receiptDataUrl.includes(';base64,')
+    ) {
+      storagePath = receiptDataUrl;
+    } else {
+      // Must upload binary WebP blob to the actual Supabase Storage bucket ('pharmacy' first)
+      let uploadErrorMessage: string | null = null;
+      try {
+        const blob = dataUrlToBlob(receiptDataUrl);
+        const fileName = `receipt_${orderId}_${Date.now()}.webp`;
+        const candidatePaths = [
+          `orders/${orderId}/receipts/${fileName}`,
+          `${orderId}/${fileName}`,
+          `receipts/${orderId}/${fileName}`,
+        ];
+        const bucketsToTry = ['pharmacy', 'driver-documents'];
 
-      let uploaded = false;
-      for (const bucket of bucketsToTry) {
-        if (uploaded) break;
-        for (const candidatePath of candidatePaths) {
-          const { error: upErr } = await supabase.storage
-            .from(bucket)
-            .upload(candidatePath, blob, {
-              contentType: mimeType,
-              upsert: true,
-            });
-          if (!upErr) {
-            const { data: pubData } = supabase.storage.from(bucket).getPublicUrl(candidatePath);
-            storagePath = pubData?.publicUrl || `${bucket}/${candidatePath}`;
-            uploaded = true;
-            break;
+        for (const bucket of bucketsToTry) {
+          if (storagePath) break;
+          for (const candidatePath of candidatePaths) {
+            const { error: upErr } = await supabase.storage
+              .from(bucket)
+              .upload(candidatePath, blob, {
+                contentType: mimeType,
+                upsert: true,
+              });
+            if (!upErr) {
+              const { data: pubData } = supabase.storage.from(bucket).getPublicUrl(candidatePath);
+              storagePath = pubData?.publicUrl || `${bucket}/${candidatePath}`;
+              break;
+            } else {
+              uploadErrorMessage = upErr.message;
+            }
           }
         }
+      } catch (uploadErr: any) {
+        uploadErrorMessage = uploadErr?.message || String(uploadErr);
       }
-    } catch (uploadErr) {
-      console.warn('[SupabasePharmacyRepository] Storage upload fallback to data URL:', uploadErr);
+
+      // Requirement: If upload to Supabase Storage fails, STOP immediately and throw clear error.
+      // Do NOT call RPC with Data URL or Base64!
+      if (!storagePath || storagePath.startsWith('data:') || storagePath.includes(';base64,')) {
+        throw new Error(
+          `فشل رفع صورة الفاتورة إلى مساحة التخزين (Storage): ${
+            uploadErrorMessage || 'تعذر الوصول إلى مساحة التخزين أو إنشاء رابط الصورة'
+          }. تم إيقاف العملية لمنع حفظ بيانات غير صالحة.`
+        );
+      }
     }
 
-    // Call authoritative RPC to register receipt image
+    // Call authoritative RPC to register receipt image ONLY with a valid storage URL
     const { error } = await supabase.rpc('pharmacy_driver_add_receipt', {
       p_order_id: orderId,
       p_storage_path: storagePath,

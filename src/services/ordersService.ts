@@ -1,5 +1,19 @@
-import { DeliveryOrder, PharmacyOrder, OrderStatus, OrderFilter, OrderType, OrderItem } from '../types';
+import {
+  DeliveryOrder,
+  PharmacyOrder,
+  OrderStatus,
+  OrderFilter,
+  OrderType,
+  OrderItem,
+  CentralGeoContext,
+  DeliveryDriver,
+} from '../types';
 import { getSupabaseClient, isSupabaseConfigured, subscribeToRealtimeChanges } from './supabaseClient';
+import {
+  evaluateCentralCoverageMatch,
+  extractOrderFinancialBreakdown,
+  loadFullCentralGeoContext,
+} from '../lib/geoCoverageService';
 
 // Helper to normalize delivery order status from DB
 function normalizeOrderStatus(rawStatus: any): OrderStatus {
@@ -64,7 +78,9 @@ class OrdersService {
   private lastSyncTime: Date = new Date();
   private lastSyncError: string | null = null;
   private currentDriverId: string | null = null;
+  private currentDriverRecord: DeliveryDriver | null = null;
   private currentDriverZone: { governorate?: string; center?: string } = {};
+  private centralGeoContext: CentralGeoContext | null = null;
 
   // Browser event handler bindings
   private onOnlineBound: () => void;
@@ -302,31 +318,33 @@ class OrdersService {
     this.lastSyncError = null;
 
     try {
-      // 1. Determine authenticated driver ID & zone from "delivery_drivers"
+      // 1. Determine authenticated driver record from "delivery_drivers"
       let effectiveDriverId = this.currentDriverId;
+      let driverRecord: DeliveryDriver | null = this.currentDriverRecord;
       let effectiveGovernorate = this.currentDriverZone.governorate;
       let effectiveCenter = this.currentDriverZone.center;
 
       try {
         const { data: { user } } = await client.auth.getUser();
         if (user) {
-          // Look up driver record in delivery_drivers
           let { data: driverRow } = await client
             .from('delivery_drivers')
-            .select('id, user_id, full_name, phone, status, is_active, governorate_name, governorate_code, markaz_name')
+            .select('*')
             .eq('user_id', user.id)
             .maybeSingle();
 
           if (!driverRow) {
             const resById = await client
               .from('delivery_drivers')
-              .select('id, user_id, full_name, phone, status, is_active, governorate_name, governorate_code, markaz_name')
+              .select('*')
               .eq('id', user.id)
               .maybeSingle();
             driverRow = resById.data;
           }
 
           if (driverRow) {
+            driverRecord = driverRow as DeliveryDriver;
+            this.currentDriverRecord = driverRecord;
             effectiveDriverId = driverRow.id;
             this.currentDriverId = driverRow.id;
             effectiveGovernorate = driverRow.governorate_name || effectiveGovernorate;
@@ -340,12 +358,19 @@ class OrdersService {
         console.warn('[OrdersService] Could not resolve driver session from auth:', err);
       }
 
-      // 2. Fetch Regular Orders from "delivery_orders"
+      // 1b. Load authoritative central geo hierarchy & driver coverage
+      if (driverRecord) {
+        this.centralGeoContext = await loadFullCentralGeoContext(client, driverRecord);
+      } else {
+        this.centralGeoContext = null;
+      }
+
+      // 2. Fetch Regular & Restaurant Orders from "delivery_orders"
       const { regularOrdersList, historyFromRegular } = await this.fetchDeliveryOrdersFromDB(
         client,
         effectiveDriverId,
-        effectiveGovernorate,
-        effectiveCenter
+        driverRecord,
+        this.centralGeoContext
       );
 
       // 3. Fetch Pharmacy Orders from "pharmacy_orders" and related tables
@@ -353,21 +378,15 @@ class OrdersService {
         client,
         effectiveDriverId,
         effectiveGovernorate,
-        effectiveCenter
+        effectiveCenter,
+        driverRecord,
+        this.centralGeoContext
       );
 
-      // 4. Update collections if any authoritative records returned
-      if (regularOrdersList.length > 0 || historyFromRegular.length > 0) {
-        this.regularOrders = regularOrdersList;
-      }
-      if (pharmacyOrdersList.length > 0 || historyFromPharmacy.length > 0) {
-        this.pharmacyOrders = pharmacyOrdersList;
-      }
-
-      const combinedHistory = [...historyFromRegular, ...historyFromPharmacy];
-      if (combinedHistory.length > 0) {
-        this.historyOrders = combinedHistory;
-      }
+      // 4. Update collections cleanly (always sync authoritative list, clearing removed/unassigned orders)
+      this.regularOrders = regularOrdersList;
+      this.pharmacyOrders = pharmacyOrdersList;
+      this.historyOrders = [...historyFromRegular, ...historyFromPharmacy];
     } catch (err: any) {
       console.error('[OrdersService] Authoritative fetch error (preserving cached data):', err);
       this.lastSyncError = err?.message || 'تعذر جلب الطلبات من قاعدة البيانات';
@@ -386,8 +405,8 @@ class OrdersService {
   private async fetchDeliveryOrdersFromDB(
     client: any,
     driverId: string | null,
-    governorate?: string,
-    center?: string
+    driverRecord: DeliveryDriver | null,
+    geoContext: CentralGeoContext | null
   ): Promise<{ regularOrdersList: DeliveryOrder[]; historyFromRegular: DeliveryOrder[] }> {
     const regularOrdersList: DeliveryOrder[] = [];
     const historyFromRegular: DeliveryOrder[] = [];
@@ -457,18 +476,16 @@ class OrdersService {
           continue;
         }
 
-        // 2. If unassigned, must be in acceptable state and matching zone if set
+        // 2. If unassigned, must be in acceptable state and match central geo coverage IDs
         if (!assignedDriverId) {
           if (orderStatus === 'delivered' || orderStatus === 'cancelled') {
             continue;
           }
-          const rowGov = row.governorate_name || row.governorate;
-          const rowMarkaz = row.markaz_name || row.center;
-          if (governorate && rowGov && rowGov !== governorate) {
-            continue;
-          }
-          if (center && rowMarkaz && rowMarkaz !== center) {
-            continue;
+          if (driverRecord) {
+            const matchRes = evaluateCentralCoverageMatch(row, driverRecord, geoContext);
+            if (!matchRes.matched) {
+              continue;
+            }
           }
         }
 
@@ -504,12 +521,24 @@ class OrdersService {
           ? items.reduce((sum, it) => sum + it.quantity, 0)
           : Number(row.items_count || 1);
 
-        const total = Number(row.total_amount || row.total || row.total_price || 0);
-        const deliveryFee = Number(row.delivery_fee || row.shipping_fee || 18);
-        const subtotal = Number(row.subtotal || (total > deliveryFee ? total - deliveryFee : total));
-        const driverFee = Number(row.driver_fee || (deliveryFee > 0 ? deliveryFee * 0.9 : 16));
+        // Extract stored financial fields strictly without computing 90% or injecting 15/16/18/20 defaults
+        const fin = extractOrderFinancialBreakdown(row);
+        const total = fin.totalAmount;
+        const deliveryFee = fin.deliveryFee;
+        const subtotal = fin.subtotal;
+        const driverFee = fin.deliveryDriverNet;
         const isPaid = Boolean(row.is_paid || row.payment_status === 'paid');
         const paymentMethod = (row.payment_method || (isPaid ? 'card' : 'cash')) as any;
+
+        const matchedAreaObj = row.delivery_area_id && geoContext?.areas
+          ? geoContext.areas.find((a) => String(a.id) === String(row.delivery_area_id))
+          : null;
+        const resolvedAreaName =
+          row.delivery_area_name ||
+          row.area_name ||
+          matchedAreaObj?.name_ar ||
+          matchedAreaObj?.name ||
+          null;
 
         const deliveryOrder: DeliveryOrder = {
           id: String(row.id),
@@ -519,39 +548,51 @@ class OrdersService {
           assigned_driver_id: assignedDriverId || undefined,
           governorate_name: row.governorate_name || row.governorate,
           markaz_name: row.markaz_name || row.center,
+          delivery_governorate_id: row.delivery_governorate_id ?? null,
+          delivery_center_id: row.delivery_center_id ?? null,
+          delivery_area_id: row.delivery_area_id ?? null,
+          delivery_area_name: resolvedAreaName,
+          delivery_latitude: row.delivery_latitude ?? null,
+          delivery_longitude: row.delivery_longitude ?? null,
+          address_latitude: row.address_latitude ?? null,
+          address_longitude: row.address_longitude ?? null,
+          restaurant_latitude: row.restaurant_latitude ?? null,
+          restaurant_longitude: row.restaurant_longitude ?? null,
+          pickup_latitude: row.pickup_latitude ?? null,
+          pickup_longitude: row.pickup_longitude ?? null,
           createdAt: row.created_at
             ? new Date(row.created_at).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
             : 'الآن',
-          estimatedDeliveryTime: row.estimated_delivery_time || '30 دقيقة',
+          estimatedDeliveryTime: row.estimated_delivery_time || undefined,
           store: {
             id: String(row.store_id || row.restaurant_id || 'str-1'),
             name: row.store_name || row.restaurant_name || 'مطعم ومتجر طلبات البيت',
-            phone: row.store_phone || row.restaurant_phone || '0590000000',
+            phone: row.store_phone || row.restaurant_phone || '',
             address: row.store_address || row.pickup_address || 'الفرع الرئيسي',
-            area: row.store_area || row.pickup_area || row.governorate_name || row.governorate || 'وسط المدينة',
-            latitude: row.store_lat || row.pickup_latitude,
-            longitude: row.store_lng || row.pickup_longitude,
+            area: row.store_area || row.pickup_area || row.delivery_area_name || row.governorate_name || row.governorate || '',
+            latitude: row.restaurant_latitude ?? row.pickup_latitude ?? row.store_lat ?? undefined,
+            longitude: row.restaurant_longitude ?? row.pickup_longitude ?? row.store_lng ?? undefined,
           },
           customer: {
             id: String(row.customer_id || row.user_id || 'cst-1'),
             name: row.customer_name || 'عميل طلبات البيت',
-            phone: row.customer_phone || '0500000000',
-            address: row.delivery_address || row.customer_address || row.address || 'العنوان المسجل',
-            area: row.area || row.customer_area || row.markaz_name || row.governorate_name || 'المنطقة الحالية',
+            phone: row.customer_phone || '',
+            address: row.detailed_address || row.delivery_address || row.customer_address || row.address || 'العنوان المسجل',
+            area: row.delivery_area_name || row.area || row.customer_area || row.markaz_name || row.governorate_name || '',
             buildingNumber: row.building_number,
             floorNumber: row.floor_number,
             apartmentNumber: row.apartment_number,
             notes: row.notes || row.customer_notes,
-            latitude: row.latitude || row.delivery_latitude,
-            longitude: row.longitude || row.delivery_longitude,
+            latitude: row.delivery_latitude ?? row.address_latitude ?? undefined,
+            longitude: row.delivery_longitude ?? row.address_longitude ?? undefined,
           },
           items: items.length > 0 ? items : [
             {
               id: `itm-single-${row.id}`,
               name: row.items_summary || 'طلب توصيل معتمد',
               quantity: itemsCount,
-              unitPrice: subtotal,
-              totalPrice: subtotal,
+              unitPrice: subtotal ?? 0,
+              totalPrice: subtotal ?? 0,
             },
           ],
           itemsCount,
@@ -562,7 +603,7 @@ class OrdersService {
           driverFee,
           paymentMethod,
           isPaid,
-          distanceKm: Number(row.distance_km || row.distance || 3.8),
+          distanceKm: Number(row.distance_km || row.distance || 0),
           specialInstructions: row.special_instructions || row.driver_notes,
           governorate: row.governorate_name || row.governorate,
           center: row.markaz_name || row.center,
@@ -572,6 +613,11 @@ class OrdersService {
           detailed_address: row.detailed_address,
           order_number: row.order_number,
           total_amount: total,
+          delivery_fee: deliveryFee,
+          delivery_base_fee: fin.deliveryBaseFee,
+          delivery_admin_commission: fin.deliveryAdminCommission,
+          delivery_driver_net: fin.deliveryDriverNet,
+          customer_delivery_fee: fin.customerDeliveryFee,
           delivery_notes: row.delivery_notes,
           household_id: row.household_id,
           created_at: row.created_at,
@@ -579,6 +625,13 @@ class OrdersService {
           actual_items_total: row.actual_items_total,
           actual_total_amount: row.actual_total_amount,
           raw_status: row.status,
+          restaurant_id: row.restaurant_id ?? undefined,
+          restaurant_name: row.restaurant_name ?? undefined,
+          restaurant_phone: row.restaurant_phone ?? undefined,
+          delivery_by: row.delivery_by ?? undefined,
+          delivered_by: row.delivered_by ?? undefined,
+          is_restaurant_delivery: row.is_restaurant_delivery ?? undefined,
+          is_talabaty_delivery: row.is_talabaty_delivery ?? undefined,
         };
 
         if (orderStatus === 'delivered' || orderStatus === 'cancelled') {
@@ -600,7 +653,9 @@ class OrdersService {
     client: any,
     driverId: string | null,
     governorate?: string,
-    center?: string
+    center?: string,
+    driverRecord?: DeliveryDriver | null,
+    geoContext?: CentralGeoContext | null
   ): Promise<{ pharmacyOrdersList: PharmacyOrder[]; historyFromPharmacy: DeliveryOrder[] }> {
     const pharmacyOrdersList: PharmacyOrder[] = [];
     const historyFromPharmacy: DeliveryOrder[] = [];
@@ -722,18 +777,29 @@ class OrdersService {
           continue;
         }
 
-        // 2. If unassigned, must be available and match zone if defined
+        // 2. If unassigned, check central geo IDs if explicitly present on pharmacy_orders;
+        // otherwise preserve existing pharmacy flow until backend adds central geo IDs to pharmacy_orders
         if (!assignedDriverId) {
           if (orderStatus === 'delivered' || orderStatus === 'cancelled') {
             continue;
           }
-          const rowGov = row.address_governorate_name || row.governorate;
-          const rowMarkaz = row.address_center_name || row.center;
-          if (governorate && rowGov && rowGov !== governorate) {
-            continue;
-          }
-          if (center && rowMarkaz && rowMarkaz !== center) {
-            continue;
+          const hasCentralIds = Boolean(
+            row.delivery_area_id || row.delivery_center_id || row.delivery_governorate_id
+          );
+          if (hasCentralIds && driverRecord) {
+            const matchRes = evaluateCentralCoverageMatch(row, driverRecord, geoContext);
+            if (!matchRes.matched) {
+              continue;
+            }
+          } else {
+            const rowGov = row.address_governorate_name || row.governorate;
+            const rowMarkaz = row.address_center_name || row.center;
+            if (governorate && rowGov && rowGov !== governorate) {
+              continue;
+            }
+            if (center && rowMarkaz && rowMarkaz !== center) {
+              continue;
+            }
           }
         }
 
@@ -824,11 +890,17 @@ class OrdersService {
           ? items.reduce((sum, it) => sum + it.quantity, 0)
           : Number(row.items_count || 1);
 
-        const deliveryFee = Number(row.delivery_fee || 20);
+        const fin = extractOrderFinancialBreakdown(row);
+        const deliveryFee = fin.deliveryFee;
         const medicinesTotal = Number(row.medicines_total || 0);
-        const grandTotal = Number(row.grand_total || (medicinesTotal + deliveryFee));
+        const grandTotal =
+          fin.totalAmount !== null
+            ? fin.totalAmount
+            : deliveryFee !== null
+            ? medicinesTotal + deliveryFee
+            : null;
         const subtotal = medicinesTotal;
-        const driverFee = Number(deliveryFee > 0 ? deliveryFee * 0.9 : 18);
+        const driverFee = fin.deliveryDriverNet;
         const isPaid = false;
 
         const pharmacyOrder: PharmacyOrder = {

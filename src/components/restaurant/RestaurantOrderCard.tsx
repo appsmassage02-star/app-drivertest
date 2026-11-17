@@ -13,7 +13,10 @@ import {
   Bike,
 } from 'lucide-react';
 import { DeliveryOrder } from '../../types';
-import { getRestaurantStatusBadge } from '../../lib/restaurantService';
+import {
+  getRestaurantStatusBadge,
+  computeRestaurantFinancials,
+} from '../../lib/restaurantService';
 import { formatSafeTime, formatSafeDateTime } from '../../App';
 
 interface RestaurantOrderCardProps {
@@ -28,6 +31,7 @@ interface RestaurantOrderCardProps {
   onCompleteOrder: (order: DeliveryOrder) => void;
   onRequestCancellation: (order: DeliveryOrder) => void;
   onCallPhone: (phone: string) => void;
+  onOpenMap?: (order: DeliveryOrder) => void;
 }
 
 export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
@@ -42,6 +46,7 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
   onCompleteOrder,
   onRequestCancellation,
   onCallPhone,
+  onOpenMap,
 }) => {
   const isAssignedToCurrent = order.assigned_driver_id === currentDriverId;
   const statusBadge = getRestaurantStatusBadge(order.status);
@@ -77,15 +82,18 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
     order.detailed_address ||
     order.customer?.area ||
     'عنوان العميل المسجل';
+  const areaLabel = order.delivery_area_name || order.markaz_name || order.governorate_name || null;
 
-  const totalAmount = Number(
-    order.actual_total_amount && order.actual_total_amount > 0
-      ? order.actual_total_amount
-      : order.total_amount || order.total || 0
-  );
+  const {
+    totalAmount,
+    deliveryFee,
+    deliveryDriverNet,
+    deliveryAdminCommission,
+    hasIncompletePricing,
+  } = computeRestaurantFinancials(order);
 
   const items = order.items || [];
-  const itemsCount = items.length > 0 ? items.length : order.itemsCount || 1;
+  const itemsCount = items.length > 0 ? items.length : order.itemsCount ?? null;
 
   return (
     <div className="bg-white rounded-2xl border-2 border-orange-200/80 shadow-xs hover:shadow-md transition overflow-hidden flex flex-col justify-between">
@@ -119,7 +127,9 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
           <div className="inline-flex items-center space-x-1.5 space-x-reverse bg-emerald-50 text-emerald-900 border border-emerald-300 px-2.5 py-1 rounded-xl text-xs font-extrabold">
             <Banknote className="w-3.5 h-3.5 text-emerald-700" />
             <span>تحصيل كاش:</span>
-            <span className="font-mono">{totalAmount.toFixed(2)} ج.م</span>
+            <span className="font-mono">
+              {totalAmount !== null ? `${totalAmount.toFixed(2)} ج.م` : 'غير مكتمل'}
+            </span>
           </div>
         </div>
 
@@ -168,19 +178,29 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
           </div>
           <div className="flex items-start space-x-1.5 space-x-reverse text-[11px] text-neutral-600 pr-1">
             <MapPin className="w-3.5 h-3.5 text-neutral-500 shrink-0 mt-0.5" />
-            <span className="line-clamp-1">توصيل إلى: {customerAddress}</span>
+            <span className="line-clamp-1">
+              توصيل إلى: {areaLabel ? `${areaLabel} — ` : ''}{customerAddress}
+            </span>
           </div>
         </div>
 
         {/* Order Items Preview */}
         <div className="text-xs space-y-1 pt-1 border-t border-neutral-100">
-          <div className="flex items-center justify-between text-neutral-700 font-bold">
+          <div className="flex items-center justify-between flex-wrap gap-1 text-neutral-700 font-bold">
             <span className="flex items-center space-x-1.5 space-x-reverse">
               <UtensilsCrossed className="w-3.5 h-3.5 text-orange-600" />
-              <span>الوجبات والأصناف المطلوبة ({itemsCount}):</span>
+              <span>
+                الوجبات والأصناف المطلوبة{itemsCount !== null ? ` (${itemsCount})` : ''}:
+              </span>
             </span>
-            <span className="text-neutral-500 text-[11px]">
-              رسوم التوصيل: {Number(order.delivery_fee || order.deliveryFee || 15).toFixed(2)} ج.م
+            <span className="text-neutral-600 text-[11px]">
+              {deliveryDriverNet !== null
+                ? `صافي السائق: ${deliveryDriverNet.toFixed(2)} ج.م`
+                : deliveryFee !== null
+                ? `رسوم التوصيل: ${deliveryFee.toFixed(2)} ج.م`
+                : hasIncompletePricing || deliveryAdminCommission === null
+                ? 'البيانات المالية غير مكتملة'
+                : 'البيانات المالية غير مكتملة'}
             </span>
           </div>
           <div className="bg-neutral-50 p-2.5 rounded-xl border border-neutral-200/80 text-[11px] text-neutral-700 max-h-24 overflow-y-auto space-y-1 divide-y divide-neutral-200/60">
@@ -216,18 +236,32 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
 
       {/* Action Footer */}
       <div className="p-4 bg-neutral-50 border-t border-neutral-200 flex flex-wrap items-center justify-between gap-2">
-        <button
-          type="button"
-          onClick={() => onOpenDetails(order)}
-          className="px-3.5 py-2 bg-white hover:bg-neutral-100 active:scale-95 text-neutral-700 border border-neutral-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
-        >
-          <Eye className="w-3.5 h-3.5" />
-          <span>تفاصيل الطلب</span>
-        </button>
+        <div className="flex items-center space-x-1.5 space-x-reverse">
+          <button
+            type="button"
+            onClick={() => onOpenDetails(order)}
+            className="px-3 py-2 bg-white hover:bg-neutral-100 active:scale-95 text-neutral-700 border border-neutral-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
+          >
+            <Eye className="w-3.5 h-3.5" />
+            <span>تفاصيل</span>
+          </button>
+
+          {onOpenMap && (
+            <button
+              type="button"
+              onClick={() => onOpenMap(order)}
+              className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 active:scale-95 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
+              title="عرض الخريطة والملاحة المباشرة"
+            >
+              <MapPin className="w-3.5 h-3.5 text-emerald-700" />
+              <span>الخريطة والملاحة</span>
+            </button>
+          )}
+        </div>
 
         <div className="flex items-center space-x-2 space-x-reverse">
           {/* Accept Order Button */}
-          {(order.status === 'pending_review' || order.status === 'new') && (
+          {order.status === 'pending_review' && (
             <button
               type="button"
               disabled={!canAccept || isActionLoading}

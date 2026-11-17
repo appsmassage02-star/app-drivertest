@@ -47,7 +47,8 @@ import {
   Store,
   Pill,
   Activity,
-  UtensilsCrossed
+  UtensilsCrossed,
+  LocateFixed
 } from 'lucide-react';
 import {
   saveCachedDeliveryOrders,
@@ -68,11 +69,25 @@ import {
 import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { EGYPT_GOVERNORATES } from './data/egyptLocations';
 import {
-  isOrderMatchingDriverTerritory,
-} from './data/locationOrderMatcher';
+  createEmptyCentralGeoContext,
+  loadFullCentralGeoContext,
+  fetchCentralGeoHierarchy,
+  evaluateCentralCoverageMatch,
+  isOrderEligibleForDriver,
+  extractOrderFinancialBreakdown,
+} from './lib/geoCoverageService';
+import { fetchDeliverySystemSettings } from './lib/driverTrackingService';
 import { usePharmacy } from './hooks/usePharmacy';
 import { useDriverAuth } from './hooks/useDriverAuth';
-import type { DeliveryDriver, DriverStatus, DriverAppState } from './types';
+import { useDriverGPS } from './hooks/useDriverGPS';
+import type {
+  CentralGeoContext,
+  DeliveryDriver,
+  DeliverySystemSettings,
+  DriverStatus,
+  GeoCenter,
+  GeoGovernorate,
+} from './types';
 import { ordersService } from './services/ordersService';
 import {
   getSupabaseClient,
@@ -84,10 +99,11 @@ import { PharmacyOrdersSection } from './components/pharmacy/PharmacyOrdersSecti
 import { PharmacyRealtimeDiagnosticModal } from './components/pharmacy/PharmacyRealtimeDiagnosticModal';
 import { RealtimeConnectionStatus } from './types/pharmacy';
 import { RestaurantOrdersSection } from './components/restaurant/RestaurantOrdersSection';
+import { OrderMapModal } from './components/maps/OrderMapModal';
 import {
   isRestaurantOrder,
-  isOrderDeliveredByRestaurant,
   isRestaurantOrderForDriver,
+  checkRestaurantRpcCompatibility,
 } from './lib/restaurantService';
 import {
   getInitialHeaderAssetSrc,
@@ -138,7 +154,7 @@ export type { DriverStatus, DeliveryDriver } from './types';
 export interface DeliverySettings {
   id: string;
   delivery_enabled: boolean;
-  default_delivery_fee: number;
+  default_delivery_fee: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -146,7 +162,7 @@ export interface DeliverySettings {
 export const DEFAULT_DELIVERY_SETTINGS: DeliverySettings = {
   id: 'default',
   delivery_enabled: true,
-  default_delivery_fee: 15.0,
+  default_delivery_fee: null,
   created_at: '',
   updated_at: '',
 };
@@ -156,7 +172,7 @@ export interface DeliveryGovernorateSetting {
   governorate_code: string;
   governorate_name: string;
   is_active: boolean;
-  delivery_fee: number;
+  delivery_fee: number | null;
   estimated_delivery_time: string | null;
   notes: string | null;
   created_at: string;
@@ -201,9 +217,23 @@ export interface DeliveryOrder {
   governorate_name: string;
   markaz_name: string;
   detailed_address: string;
-  subtotal: number;
-  delivery_fee: number;
-  total_amount: number;
+  subtotal: number | null;
+  delivery_fee: number | null;
+  total_amount: number | null;
+  delivery_base_fee?: number | null;
+  delivery_admin_commission?: number | null;
+  delivery_driver_net?: number | null;
+  customer_delivery_fee?: number | null;
+  delivery_governorate_id?: string | null;
+  delivery_center_id?: string | null;
+  delivery_area_id?: string | null;
+  delivery_area_name?: string | null;
+  delivery_latitude?: number | null;
+  delivery_longitude?: number | null;
+  pickup_latitude?: number | null;
+  pickup_longitude?: number | null;
+  address_latitude?: number | null;
+  address_longitude?: number | null;
   delivery_notes: string | null;
   assigned_driver_id: string | null;
   status: OrderStatus;
@@ -327,11 +357,56 @@ export default function App() {
   const successfullyUploadedDocsRef = useRef<Set<string>>(new Set());
   const acceptingOrderIdsRef = useRef<Set<string>>(new Set());
 
-  // Memoized available centers for the currently selected governorate
+  // Central geographic hierarchy for registration selector UI (loaded from geo_governorates / geo_centers)
+  const [regGeoHierarchy, setRegGeoHierarchy] = useState<{
+    governorates: GeoGovernorate[];
+    centers: GeoCenter[];
+    loaded: boolean;
+  }>({ governorates: [], centers: [], loaded: false });
+
+  // Central Geographic Coverage & Tracking Settings State
+  const [centralGeoContext, setCentralGeoContext] = useState<CentralGeoContext>(() =>
+    createEmptyCentralGeoContext()
+  );
+  const centralGeoContextRef = useRef<CentralGeoContext>(centralGeoContext);
+  centralGeoContextRef.current = centralGeoContext;
+
+  const [systemSettings, setSystemSettings] = useState<DeliverySystemSettings>({
+    driver_tracking_enabled: null,
+    max_accepted_gps_accuracy_m: null,
+    load_state: 'idle',
+  });
+
+  // Memoized available governorates and centers for registration form (prefer central DB geo tables)
+  const registrationGovernorates = useMemo(() => {
+    const activeCentralGovs = regGeoHierarchy.governorates.filter((g) => g.is_active !== false);
+    if (regGeoHierarchy.loaded && activeCentralGovs.length > 0) {
+      return activeCentralGovs.map((g) => ({
+        id: g.id,
+        name: g.name_ar || g.name || '',
+        code: g.code || null,
+      })).filter((g) => Boolean(g.name));
+    }
+    return EGYPT_GOVERNORATES.map((g) => ({ id: g.code, name: g.name, code: g.code }));
+  }, [regGeoHierarchy]);
+
   const availableCenters = useMemo(() => {
+    const activeCentralGovs = regGeoHierarchy.governorates.filter((g) => g.is_active !== false);
+    if (regGeoHierarchy.loaded && activeCentralGovs.length > 0) {
+      const matchedGov = activeCentralGovs.find(
+        (g) => (g.name_ar || g.name) === regGovernorateName
+      );
+      if (matchedGov) {
+        const centralCenters = regGeoHierarchy.centers
+          .filter((c) => c.governorate_id === matchedGov.id && c.is_active !== false)
+          .map((c) => c.name_ar || c.name || '')
+          .filter(Boolean);
+        if (centralCenters.length > 0) return centralCenters;
+      }
+    }
     const matched = EGYPT_GOVERNORATES.find((g) => g.name === regGovernorateName);
     return matched ? matched.centers : [];
-  }, [regGovernorateName]);
+  }, [regGeoHierarchy, regGovernorateName]);
 
   // Primary Live States - Strictly Real Database Data
   const currentDriverRef = useRef<DeliveryDriver | null>(null);
@@ -399,11 +474,43 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 4000);
   }, []);
 
+  // Active assigned order ID (if any) for GPS tracking telemetry context
+  const activeAssignedOrderId = useMemo(() => {
+    if (!currentDriver?.id) return null;
+    const activeOrder = orders.find(
+      (o) =>
+        o.assigned_driver_id === currentDriver.id &&
+        (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed')
+    );
+    return activeOrder ? activeOrder.id : null;
+  }, [orders, currentDriver?.id]);
+
+  // Driver Real Hardware GPS Hook (independent of maps, validates & persists via delivery_system_settings)
+  const {
+    driverLocation,
+    gpsStatus,
+    gpsErrorMessage,
+    isLoadingGPS,
+    isTrackingActive,
+    trackingAccuracyWarning,
+    lastTrackingResult,
+    requestGPSLocation,
+  } = useDriverGPS(isWorking, {
+    supabase: getClient(),
+    driverId: currentDriver?.id || null,
+    systemSettings,
+    activeOrderId: activeAssignedOrderId,
+  });
+
   // Order Category Filter ('all' | 'regular' | 'restaurant' | 'pharmacy')
   const [orderCategoryView, setOrderCategoryView] = useState<'all' | 'regular' | 'restaurant' | 'pharmacy'>('all');
   const [selectedRestaurantOrder, setSelectedRestaurantOrder] = useState<DeliveryOrder | null>(null);
+  const [mapModalTarget, setMapModalTarget] = useState<{
+    order: any;
+    orderType: 'restaurant' | 'pharmacy' | 'regular';
+  } | null>(null);
 
-  // Isolated Pharmacy Driver Hook (Stage 1: Service/Repository without Supabase mutations)
+  // Isolated Pharmacy Driver Hook
   const {
     pharmacyOrders,
     selectedPharmacyOrder,
@@ -442,6 +549,7 @@ export default function App() {
     currentDriver,
     isWorking,
     deliveryEnabled: Boolean(settings?.delivery_enabled),
+    geoContext: centralGeoContext,
     onToast: showToast,
   });
 
@@ -525,35 +633,40 @@ export default function App() {
         setHeaderImageSrc(newHeaderSrc);
       });
 
-      // 1. Fetch delivery_settings
-      const { data: sData, error: sErr } = await supabase
-        .from('delivery_settings')
-        .select('*')
-        .limit(1)
-        .maybeSingle();
-      if (!sErr && sData) {
-        setSettings(sData as DeliverySettings);
-      }
-
-      // 2. Fetch delivery_governorate_settings
-      const { data: gData, error: gErr } = await supabase
-        .from('delivery_governorate_settings')
-        .select('*')
-        .order('governorate_name', { ascending: true });
-      if (!gErr && gData) {
-        setGovernorates(gData as DeliveryGovernorateSetting[]);
-      }
-
-      // 3. Fetch delivery_orders only if authenticated driver is approved and active
+      // 1. Fetch delivery_settings + delivery_system_settings + central geo coverage
       const activeDriver = currentDriverRef.current;
+
+      const [settingsRes, govSettingsRes, sysSettings, loadedGeoContext] = await Promise.all([
+        supabase.from('delivery_settings').select('*').limit(1).maybeSingle(),
+        supabase
+          .from('delivery_governorate_settings')
+          .select('*')
+          .order('governorate_name', { ascending: true }),
+        fetchDeliverySystemSettings(supabase),
+        activeDriver
+          ? loadFullCentralGeoContext(supabase, activeDriver)
+          : Promise.resolve(createEmptyCentralGeoContext()),
+      ]);
+
+      if (!settingsRes.error && settingsRes.data) {
+        setSettings(settingsRes.data as DeliverySettings);
+      }
+
+      if (!govSettingsRes.error && govSettingsRes.data) {
+        setGovernorates(govSettingsRes.data as DeliveryGovernorateSetting[]);
+      }
+
+      setSystemSettings(sysSettings);
+      centralGeoContextRef.current = loadedGeoContext;
+      setCentralGeoContext(loadedGeoContext);
+
+      // 2. Fetch delivery_orders only if authenticated driver is approved and active
       if (!activeDriver || activeDriver.status !== 'approved' || !activeDriver.is_active) {
         setOrders([]);
         return;
       }
 
       const driverId = activeDriver.id ? String(activeDriver.id) : null;
-      const governorate = (activeDriver?.governorate_name || (activeDriver as any)?.governorate || '').trim();
-      const center = (activeDriver?.markaz_name || (activeDriver as any)?.center || '').trim();
 
       const { data: rows, error: ordersErr } = await supabase
         .from('delivery_orders')
@@ -593,6 +706,12 @@ export default function App() {
           }
         }
 
+        const areaNameById = new Map<string, string>();
+        loadedGeoContext.areas.forEach((a) => {
+          const label = a.name_ar || a.name;
+          if (a.id && label) areaNameById.set(String(a.id), label);
+        });
+
         // Deduplicate orders by id to avoid duplicate cards during Realtime bursts
         const orderMap = new Map<string, DeliveryOrder>();
         for (const row of rows) {
@@ -605,22 +724,19 @@ export default function App() {
             continue;
           }
 
-          // If restaurant order is delivered by the restaurant itself, Talabaty drivers must never receive it
-          if (isOrderDeliveredByRestaurant(row)) {
+          // Strict isolation between platform drivers and restaurant staff drivers
+          if (isRestaurantOrder(row) && !isRestaurantOrderForDriver(row, driverId, activeDriver)) {
             continue;
           }
 
-          // 2. If unassigned, must be in acceptable state and matching zone if set
+          // 2. If unassigned -> evaluate STRICTLY via central geographic coverage IDs
+          // Never reject assigned orders of the current driver even if coverage changed later
           if (!assignedDriverId) {
             if (row.status === 'completed' || row.status === 'delivered' || row.status === 'cancelled') {
               continue;
             }
-            const rowGov = (row.governorate_name || row.governorate || '').trim();
-            const rowMarkaz = (row.markaz_name || row.center || '').trim();
-            if (governorate && rowGov && rowGov !== governorate) {
-              continue;
-            }
-            if (center && rowMarkaz && rowMarkaz !== center) {
+            const centralMatch = evaluateCentralCoverageMatch(row, activeDriver, loadedGeoContext);
+            if (!centralMatch.matched) {
               continue;
             }
           }
@@ -631,12 +747,45 @@ export default function App() {
               ? row.delivery_order_items
               : (directItemsMap[String(row.id)] || []));
 
-          row.items = rawItems;
-          row.assigned_driver_id = assignedDriverId;
-          row.type = isRestaurantOrder(row) ? 'restaurant' : 'regular';
+          const resolvedAreaId = row.delivery_area_id ? String(row.delivery_area_id) : null;
+          const resolvedAreaName =
+            row.delivery_area_name ||
+            row.area_name ||
+            (resolvedAreaId ? areaNameById.get(resolvedAreaId) || null : null);
+
+          const normalizedOrder: DeliveryOrder = {
+            ...(row as any),
+            items: rawItems,
+            assigned_driver_id: assignedDriverId,
+            type: isRestaurantOrder(row) ? 'restaurant' : 'regular',
+            delivery_governorate_id: row.delivery_governorate_id ? String(row.delivery_governorate_id) : null,
+            delivery_center_id: row.delivery_center_id ? String(row.delivery_center_id) : null,
+            delivery_area_id: resolvedAreaId,
+            delivery_area_name: resolvedAreaName,
+            subtotal: row.subtotal !== null && row.subtotal !== undefined ? Number(row.subtotal) : null,
+            delivery_fee: row.delivery_fee !== null && row.delivery_fee !== undefined ? Number(row.delivery_fee) : null,
+            total_amount: row.total_amount !== null && row.total_amount !== undefined ? Number(row.total_amount) : null,
+            delivery_base_fee:
+              row.delivery_base_fee !== null && row.delivery_base_fee !== undefined
+                ? Number(row.delivery_base_fee)
+                : null,
+            delivery_admin_commission:
+              row.delivery_admin_commission !== null && row.delivery_admin_commission !== undefined
+                ? Number(row.delivery_admin_commission)
+                : null,
+            delivery_driver_net:
+              row.delivery_driver_net !== null && row.delivery_driver_net !== undefined
+                ? Number(row.delivery_driver_net)
+                : null,
+            customer_delivery_fee:
+              row.customer_delivery_fee !== null && row.customer_delivery_fee !== undefined
+                ? Number(row.customer_delivery_fee)
+                : null,
+          };
+
           const orderIdStr = String(row.id);
           if (!orderMap.has(orderIdStr)) {
-            orderMap.set(orderIdStr, row as DeliveryOrder);
+            orderMap.set(orderIdStr, normalizedOrder);
           }
         }
 
@@ -663,12 +812,40 @@ export default function App() {
     }
   }, []);
 
+  // Load central geo hierarchy for registration dropdowns when Supabase is configured
+  useEffect(() => {
+    const supabase = getClient();
+    if (!supabase) return;
+    let active = true;
+    void fetchCentralGeoHierarchy(supabase).then((res) => {
+      if (!active) return;
+      if (res.geoLoadState === 'loaded' && res.governorates.length > 0) {
+        setRegGeoHierarchy({
+          governorates: res.governorates,
+          centers: res.centers,
+          loaded: true,
+        });
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [supabaseUser?.id]);
+
   // Synchronize orders when driver becomes approved and active
   useEffect(() => {
     if (authStatus === 'approved_active') {
       void syncWithSupabase();
     } else {
       setOrders([]);
+      const emptyCtx = createEmptyCentralGeoContext();
+      centralGeoContextRef.current = emptyCtx;
+      setCentralGeoContext(emptyCtx);
+      setSystemSettings({
+        driver_tracking_enabled: null,
+        max_accepted_gps_accuracy_m: null,
+        load_state: 'idle',
+      });
     }
   }, [authStatus, syncWithSupabase]);
 
@@ -1267,9 +1444,12 @@ export default function App() {
         // Ignore local storage quota limits
       }
 
-      // Lookup governorate code
+      // Lookup governorate code from central geo_governorates first, fallback for static code lookup if anon RLS restricts table
+      const centralGovMatch = regGeoHierarchy.governorates.find(
+        (g) => (g.name_ar || g.name) === regGovernorateName.trim()
+      );
       const matchedGov = EGYPT_GOVERNORATES.find((g) => g.name === regGovernorateName.trim());
-      const matchedGovCode = matchedGov ? matchedGov.code : null;
+      const matchedGovCode = centralGovMatch?.code || (matchedGov ? matchedGov.code : null);
 
       // Note: Store only clean storage path strings in the Postgres text columns, NOT Base64!
       const driverRecord = {
@@ -1343,7 +1523,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    // Attempt to set availability to false on server before signing out
+    // Attempt to set availability to false on server before signing out (never auto-cancels assigned orders)
     if (isWorkingRef.current) {
       try {
         const supabase = getClient();
@@ -1369,6 +1549,14 @@ export default function App() {
     setSelectedOrder(null);
     setOrderHistory([]);
     setPendingOfflineCount(0);
+    const emptyCtx = createEmptyCentralGeoContext();
+    centralGeoContextRef.current = emptyCtx;
+    setCentralGeoContext(emptyCtx);
+    setSystemSettings({
+      driver_tracking_enabled: null,
+      max_accepted_gps_accuracy_m: null,
+      load_state: 'idle',
+    });
     showToast('تم تسجيل الخروج ومسح بيانات الجلسة المحلية بأمان.');
   };
 
@@ -1450,6 +1638,26 @@ export default function App() {
     }
     if (order.status !== 'pending_review') {
       showToast(`لا يمكن قبول الطلب وهو في حالة: ${order.status}`, 'error');
+      return;
+    }
+    if (isRestaurantOrder(order)) {
+      const compat = checkRestaurantRpcCompatibility(order, 'accept_delivery_order', currentDriver.id);
+      if (!compat.compatible) {
+        showToast(compat.reason, 'error');
+        return;
+      }
+    }
+
+    const centralEligibility = isOrderEligibleForDriver(order, currentDriver, {
+      isWorking,
+      deliveryEnabled: Boolean(settings?.delivery_enabled),
+      geoContext: centralGeoContextRef.current,
+    });
+    if (!centralEligibility.matched) {
+      showToast(
+        centralEligibility.reason || 'هذا الطلب خارج نطاق التغطية الجغرافية المركزية المفعلة لك.',
+        'error'
+      );
       return;
     }
 
@@ -1565,6 +1773,13 @@ export default function App() {
       showToast('غير مصرح لك ببدء التسوق لطلب مخصص لسائق آخر.', 'error');
       return;
     }
+    if (isRestaurantOrder(order)) {
+      const compat = checkRestaurantRpcCompatibility(order, 'driver_start_shopping', currentDriver.id);
+      if (!compat.compatible) {
+        showToast(compat.reason, 'error');
+        return;
+      }
+    }
 
     setIsActionLoading(true);
     try {
@@ -1640,6 +1855,26 @@ export default function App() {
     missingReason?: string
   ) => {
     if (!currentDriver || isActionLoading) return;
+
+    const targetOrderForItem =
+      orders.find((o) => o.id === item.order_id) ||
+      (selectedRestaurantOrder?.id === item.order_id
+        ? selectedRestaurantOrder
+        : selectedOrder?.id === item.order_id
+        ? selectedOrder
+        : null);
+
+    if (targetOrderForItem && isRestaurantOrder(targetOrderForItem)) {
+      const compat = checkRestaurantRpcCompatibility(
+        targetOrderForItem,
+        'driver_update_delivery_item',
+        currentDriver.id
+      );
+      if (!compat.compatible) {
+        showToast(compat.reason, 'error');
+        return;
+      }
+    }
 
     if (newStatus === 'purchased') {
       if (actualPrice === undefined || actualPrice === null || isNaN(actualPrice) || actualPrice < 0) {
@@ -1768,6 +2003,13 @@ export default function App() {
       showToast(`لا يمكن إنهاء التسوق إلا عندما تكون حالة الطلب "shopping". الحالة الحالية: ${order.status}`, 'error');
       return;
     }
+    if (isRestaurantOrder(order)) {
+      const compat = checkRestaurantRpcCompatibility(order, 'driver_complete_shopping', currentDriver.id);
+      if (!compat.compatible) {
+        showToast(compat.reason, 'error');
+        return;
+      }
+    }
 
     const items = order.items || [];
     const pendingItems = items.filter((it) => !it.item_status || it.item_status === 'pending');
@@ -1825,6 +2067,13 @@ export default function App() {
     if (order.assigned_driver_id !== currentDriver.id) {
       showToast('غير مصرح لك بإتمام طلب مخصص لسائق آخر.', 'error');
       return;
+    }
+    if (isRestaurantOrder(order)) {
+      const compat = checkRestaurantRpcCompatibility(order, 'complete_delivery_order', currentDriver.id);
+      if (!compat.compatible) {
+        showToast(compat.reason, 'error');
+        return;
+      }
     }
 
     setIsActionLoading(true);
@@ -1904,6 +2153,17 @@ export default function App() {
       showToast('سبب الإلغاء إلزامي ولا يمكن تركه فارغًا.', 'error');
       return;
     }
+    if (isRestaurantOrder(cancelModalOrder)) {
+      const compat = checkRestaurantRpcCompatibility(
+        cancelModalOrder,
+        'request_order_cancellation',
+        currentDriver.id
+      );
+      if (!compat.compatible) {
+        showToast(compat.reason, 'error');
+        return;
+      }
+    }
 
     const supabase = getClient();
     const now = new Date().toISOString();
@@ -1982,13 +2242,22 @@ export default function App() {
     syncWithSupabase();
   };
 
-  // Filtered Orders for the active view tab
+  // Filtered Orders for the active view tab (pending orders strictly gated by central coverage & active work eligibility)
   const filteredOrders = useMemo(() => {
     let list = [...orders];
+    const eligibilityCtx = {
+      isWorking,
+      deliveryEnabled: Boolean(settings?.delivery_enabled),
+      geoContext: centralGeoContext,
+    };
 
-    // Status filter
     if (activeTab === 'pending') {
-      list = list.filter((o) => (o.status === 'pending_review' || o.status === 'new') && isOrderMatchingDriverTerritory(o, currentDriver));
+      list = list.filter(
+        (o) =>
+          o.status === 'pending_review' &&
+          !o.assigned_driver_id &&
+          isOrderEligibleForDriver(o, currentDriver, eligibilityCtx).matched
+      );
     } else if (activeTab === 'accepted') {
       list = list.filter(
         (o) =>
@@ -2005,7 +2274,9 @@ export default function App() {
       list = list.filter(
         (o) =>
           (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
-          (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
+          (o.assigned_driver_id === currentDriver?.id ||
+            (!o.assigned_driver_id &&
+              evaluateCentralCoverageMatch(o, currentDriver, centralGeoContext).matched))
       );
     }
 
@@ -2018,13 +2289,14 @@ export default function App() {
           o.customer_name?.toLowerCase().includes(q) ||
           o.customer_phone?.includes(q) ||
           o.detailed_address?.toLowerCase().includes(q) ||
+          o.delivery_area_name?.toLowerCase().includes(q) ||
           (o as any).restaurant_name?.toLowerCase().includes(q) ||
           (o as any).store?.name?.toLowerCase().includes(q)
       );
     }
 
     return list;
-  }, [orders, activeTab, currentDriver, searchQuery]);
+  }, [orders, activeTab, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext, searchQuery]);
 
   // Separate Home (Regular) vs Restaurant orders
   const filteredHomeOrders = useMemo(() => {
@@ -2032,14 +2304,24 @@ export default function App() {
   }, [filteredOrders]);
 
   const filteredRestaurantOrders = useMemo(() => {
-    return filteredOrders.filter((o) => isRestaurantOrderForDriver(o));
-  }, [filteredOrders]);
+    return filteredOrders.filter((o) => isRestaurantOrderForDriver(o, currentDriver?.id, currentDriver));
+  }, [filteredOrders, currentDriver]);
 
   // Home (Regular) Order Counts
   const homeCounts = useMemo(() => {
     const homeList = orders.filter((o) => !isRestaurantOrder(o));
+    const eligibilityCtx = {
+      isWorking,
+      deliveryEnabled: Boolean(settings?.delivery_enabled),
+      geoContext: centralGeoContext,
+    };
     return {
-      pending: homeList.filter((o) => (o.status === 'pending_review' || o.status === 'new') && isOrderMatchingDriverTerritory(o, currentDriver)).length,
+      pending: homeList.filter(
+        (o) =>
+          o.status === 'pending_review' &&
+          !o.assigned_driver_id &&
+          isOrderEligibleForDriver(o, currentDriver, eligibilityCtx).matched
+      ).length,
       accepted: homeList.filter(
         (o) =>
           (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed') &&
@@ -2053,16 +2335,30 @@ export default function App() {
       cancelled: homeList.filter(
         (o) =>
           (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
-          (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
+          (o.assigned_driver_id === currentDriver?.id ||
+            (!o.assigned_driver_id &&
+              evaluateCentralCoverageMatch(o, currentDriver, centralGeoContext).matched))
       ).length,
     };
-  }, [orders, currentDriver]);
+  }, [orders, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext]);
 
   // Restaurant Order Counts
   const restaurantCounts = useMemo(() => {
-    const restList = orders.filter((o) => isRestaurantOrderForDriver(o));
+    const restList = orders.filter((o) =>
+      isRestaurantOrderForDriver(o, currentDriver?.id, currentDriver)
+    );
+    const eligibilityCtx = {
+      isWorking,
+      deliveryEnabled: Boolean(settings?.delivery_enabled),
+      geoContext: centralGeoContext,
+    };
     return {
-      pending: restList.filter((o) => (o.status === 'pending_review' || o.status === 'new') && isOrderMatchingDriverTerritory(o, currentDriver)).length,
+      pending: restList.filter(
+        (o) =>
+          o.status === 'pending_review' &&
+          !o.assigned_driver_id &&
+          isOrderEligibleForDriver(o, currentDriver, eligibilityCtx).matched
+      ).length,
       accepted: restList.filter(
         (o) =>
           (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed') &&
@@ -2076,10 +2372,12 @@ export default function App() {
       cancelled: restList.filter(
         (o) =>
           (o.status === 'cancelled' || o.status === 'cancellation_pending') &&
-          (o.assigned_driver_id === currentDriver?.id || isOrderMatchingDriverTerritory(o, currentDriver))
+          (o.assigned_driver_id === currentDriver?.id ||
+            (!o.assigned_driver_id &&
+              evaluateCentralCoverageMatch(o, currentDriver, centralGeoContext).matched))
       ).length,
     };
-  }, [orders, currentDriver]);
+  }, [orders, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext]);
 
   // Keep 'counts' as alias to homeCounts for backwards compatibility
   const counts = homeCounts;
@@ -2290,6 +2588,20 @@ export default function App() {
                         onChange={(e) => {
                           const newGov = e.target.value;
                           setRegGovernorateName(newGov);
+                          const activeCentralGovs = regGeoHierarchy.governorates.filter((g) => g.is_active !== false);
+                          if (regGeoHierarchy.loaded && activeCentralGovs.length > 0) {
+                            const matchedCentral = activeCentralGovs.find(
+                              (g) => (g.name_ar || g.name) === newGov
+                            );
+                            if (matchedCentral) {
+                              const centers = regGeoHierarchy.centers
+                                .filter((c) => c.governorate_id === matchedCentral.id && c.is_active !== false)
+                                .map((c) => c.name_ar || c.name || '')
+                                .filter(Boolean);
+                              setRegMarkazName(centers[0] || '');
+                              return;
+                            }
+                          }
                           const matched = EGYPT_GOVERNORATES.find((g) => g.name === newGov);
                           if (matched && matched.centers.length > 0) {
                             setRegMarkazName(matched.centers[0]);
@@ -2299,8 +2611,8 @@ export default function App() {
                         }}
                         className="w-full text-xs border border-neutral-300 rounded-xl p-3 focus:outline-hidden focus:border-emerald-600 font-semibold bg-white"
                       >
-                        {EGYPT_GOVERNORATES.map((gov) => (
-                          <option key={gov.code} value={gov.name}>
+                        {registrationGovernorates.map((gov) => (
+                          <option key={gov.id} value={gov.name}>
                             {gov.name}
                           </option>
                         ))}
@@ -3312,6 +3624,69 @@ export default function App() {
           )
         )}
 
+        {/* Driver Hardware GPS & Central Tracking Status Bar */}
+        {currentDriver && currentDriver.status === 'approved' && currentDriver.is_active && (
+          <div className="bg-white border border-neutral-200 rounded-2xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs shadow-2xs">
+            <div className="flex items-center space-x-2 space-x-reverse flex-wrap gap-y-1">
+              <LocateFixed
+                className={`w-4 h-4 shrink-0 ${
+                  gpsStatus === 'rejected_accuracy' || gpsStatus === 'rejected_mock'
+                    ? 'text-amber-600'
+                    : driverLocation
+                    ? 'text-emerald-600'
+                    : gpsStatus === 'denied' || gpsStatus === 'unavailable'
+                    ? 'text-rose-600'
+                    : 'text-neutral-500'
+                }`}
+              />
+              {driverLocation ? (
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <span className="font-bold text-neutral-900">
+                    {isTrackingActive
+                      ? 'تتبع GPS المركزي نشط'
+                      : systemSettings.driver_tracking_enabled === false
+                      ? 'موقع GPS مقروء محليًا (التتبع المركزي متوقف بالإعدادات)'
+                      : systemSettings.load_state !== 'loaded'
+                      ? 'موقع GPS مقروء محليًا (تعذر التحقق من إعدادات التتبع)'
+                      : 'موقع GPS مقروء من الجهاز'}
+                  </span>
+                  <span className="font-mono text-[11px] text-neutral-500" dir="ltr">
+                    ({driverLocation.latitude.toFixed(5)}, {driverLocation.longitude.toFixed(5)} • ±{Math.round(driverLocation.accuracy)}m)
+                  </span>
+                  {systemSettings.max_accepted_gps_accuracy_m != null && (
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-700 font-semibold">
+                      حد الدقة المعتمد: {systemSettings.max_accepted_gps_accuracy_m}م
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <span className="text-neutral-700 font-semibold">
+                  {trackingAccuracyWarning ||
+                    gpsErrorMessage ||
+                    (gpsStatus === 'requesting'
+                      ? 'جاري قراءة إحداثيات GPS من الجهاز...'
+                      : 'موقع السائق (GPS) غير محدد بعد — يمكنك تحديث الإشارة الآن.')}
+                </span>
+              )}
+              {lastTrackingResult && lastTrackingResult.status === 'db_error' && (
+                <span className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-lg">
+                  {lastTrackingResult.message}
+                </span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => void requestGPSLocation(false)}
+              disabled={isLoadingGPS}
+              className="px-3 py-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 rounded-xl text-[11px] font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shrink-0"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingGPS ? 'animate-spin text-emerald-600' : ''}`} />
+              <span>{isLoadingGPS ? 'جاري التحديد...' : 'تحديث الـ GPS'}</span>
+            </button>
+          </div>
+        )}
+
         {/* Search Bar & Order Type Switcher (Regular Orders + Pharmacy Invoice) */}
         {['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab) && (
           <div className="space-y-3">
@@ -3434,6 +3809,7 @@ export default function App() {
               currentDriver={currentDriver}
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
+              geoContext={centralGeoContext}
               pharmacyOrders={pharmacyOrders}
               selectedPharmacyOrder={selectedPharmacyOrder}
               isPharmacyLoading={isPharmacyLoading}
@@ -3457,6 +3833,7 @@ export default function App() {
               onCompleteDelivery={completePharmacyDelivery}
               onRequestCancellation={requestPharmacyCancellation}
               onCallCustomer={callCustomer}
+              onOpenMap={(ord) => setMapModalTarget({ order: ord, orderType: 'pharmacy' })}
             />
           )}
 
@@ -3484,6 +3861,7 @@ export default function App() {
               onCompleteOrder={handleCompleteOrder}
               onOpenCancellationModal={(order) => setCancelModalOrder(order)}
               onCallPhone={callCustomer}
+              onOpenMap={(ord) => setMapModalTarget({ order: ord, orderType: 'restaurant' })}
             />
           )}
 
@@ -3593,7 +3971,8 @@ export default function App() {
                             <MapPin className="w-3.5 h-3.5 text-rose-500 shrink-0 mt-0.5" />
                             <span>
                               <strong>
-                                {order.governorate_name || order.governorate} - {order.markaz_name || order.center}:
+                                {order.governorate_name || order.governorate} - {order.markaz_name || order.center}
+                                {order.delivery_area_name ? ` - ${order.delivery_area_name}` : ''}:
                               </strong>{' '}
                               {order.detailed_address}
                             </span>
@@ -3645,29 +4024,49 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Financial Totals */}
-                        <div className="pt-2 border-t border-neutral-100 flex items-center justify-between text-xs">
-                          <span className="text-neutral-500">
-                            توصيل: {Number(order.delivery_fee).toFixed(2)} ج.م
-                          </span>
-                          <span className="font-bold text-sm text-neutral-900">
-                            {order.status === 'shopping_completed' || order.status === 'completed' ? (
-                              <>
-                                الإجمالي الفعلي:{' '}
-                                <span className="text-emerald-700 font-extrabold">
-                                  {Number(order.actual_total_amount ?? order.total_amount).toFixed(2)} ج.م
+                        {/* Financial Totals (Stored fields only - zero hardcoded calculation) */}
+                        {(() => {
+                          const fin = extractOrderFinancialBreakdown(order);
+                          return (
+                            <div className="pt-2 border-t border-neutral-100 space-y-1.5 text-xs">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-neutral-600">
+                                  التوصيل:{' '}
+                                  {fin.deliveryFee != null ? `${fin.deliveryFee.toFixed(2)} ج.م` : 'غير متوفر'}
                                 </span>
-                              </>
-                            ) : (
-                              <>
-                                الإجمالي التقديري:{' '}
-                                <span className="text-neutral-800">
-                                  {Number(order.total_amount).toFixed(2)} ج.م
+                                {fin.deliveryDriverNet != null && (
+                                  <span className="text-emerald-700 font-bold">
+                                    صافي السائق: {fin.deliveryDriverNet.toFixed(2)} ج.م
+                                  </span>
+                                )}
+                                <span className="font-bold text-sm text-neutral-900">
+                                  {order.status === 'shopping_completed' || order.status === 'completed' ? (
+                                    <>
+                                      الإجمالي الفعلي:{' '}
+                                      <span className="text-emerald-700 font-extrabold">
+                                        {fin.actualTotalAmount != null || fin.totalAmount != null
+                                          ? `${Number(fin.actualTotalAmount ?? fin.totalAmount).toFixed(2)} ج.م`
+                                          : 'غير محدد'}
+                                      </span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      الإجمالي التقديري:{' '}
+                                      <span className="text-neutral-800">
+                                        {fin.totalAmount != null ? `${fin.totalAmount.toFixed(2)} ج.م` : 'غير محدد'}
+                                      </span>
+                                    </>
+                                  )}
                                 </span>
-                              </>
-                            )}
-                          </span>
-                        </div>
+                              </div>
+                              {fin.hasIncompleteFinancials && (
+                                <div className="text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">
+                                  البيانات المالية غير مكتملة
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
 
                       {/* Card Footer Actions */}
@@ -3682,6 +4081,16 @@ export default function App() {
                             <span>
                               {order.status === 'shopping' ? 'إدارة التسوق والمنتجات' : 'تفاصيل الطلب والسجل'}
                             </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setMapModalTarget({ order, orderType: 'regular' })}
+                            className="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl text-[11px] font-bold transition flex items-center space-x-1 space-x-reverse cursor-pointer"
+                            title="عرض الخريطة وملاحة الـ GPS"
+                          >
+                            <MapPin className="w-3 h-3 text-emerald-700" />
+                            <span>الخريطة والملاحة</span>
                           </button>
                         </div>
 
@@ -3889,6 +4298,56 @@ export default function App() {
                     {currentDriver.vehicle_type || 'غير محدد'} - {currentDriver.vehicle_plate || 'بدون لوحة'}
                   </div>
                 </div>
+              </div>
+
+              {/* Central Coverage Zones & Driver Affiliation */}
+              <div className="bg-emerald-50/50 p-4 rounded-2xl border border-emerald-200 space-y-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <strong className="text-emerald-950 flex items-center space-x-1.5 space-x-reverse">
+                    <MapPin className="w-3.5 h-3.5 text-emerald-700" />
+                    <span>نطاق التغطية الجغرافية المركزي المعتمد:</span>
+                  </strong>
+                  <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-white border border-emerald-200 text-emerald-900">
+                    {centralGeoContext.driverAffiliation === 'restaurant_staff'
+                      ? 'سائق مطعم (restaurant_driver_area_coverage)'
+                      : 'سائق منصة (delivery_driver_area_coverage)'}
+                  </span>
+                </div>
+                {centralGeoContext.coverageRows.filter((c) => c.is_active !== false).length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {centralGeoContext.coverageRows
+                      .filter((c) => c.is_active !== false)
+                      .map((cov) => {
+                        const area = centralGeoContext.areas.find((a) => a.id === cov.area_id);
+                        const center = centralGeoContext.centers.find(
+                          (c) => c.id === (cov.center_id || area?.center_id)
+                        );
+                        const gov = centralGeoContext.governorates.find(
+                          (g) => g.id === (cov.governorate_id || center?.governorate_id)
+                        );
+                        const label = [
+                          gov?.name_ar || gov?.name,
+                          center?.name_ar || center?.name,
+                          area?.name_ar || area?.name,
+                        ]
+                          .filter(Boolean)
+                          .join(' - ');
+                        return (
+                          <span
+                            key={cov.id}
+                            className="px-2.5 py-1 bg-white border border-emerald-200 rounded-lg text-[11px] font-semibold text-neutral-800"
+                          >
+                            {label || cov.area_id || cov.center_id || cov.governorate_id}
+                          </span>
+                        );
+                      })}
+                  </div>
+                ) : (
+                  <p className="text-amber-800 text-[11px] font-semibold">
+                    {centralGeoContext.coverageError ||
+                      'لا توجد مناطق تغطية مركزية نشطة مسجلة لهذا السائق حاليًا (لن تظهر طلبات جديدة حتى تُسجل التغطية في النظام).'}
+                  </p>
+                )}
               </div>
 
               {/* Uploaded Documents Status Confirmation in Profile */}
@@ -4486,6 +4945,7 @@ export default function App() {
                     <span className="text-neutral-500 font-semibold block">عنوان التسليم:</span>
                     <div className="font-bold text-neutral-900">
                       {selectedOrder.governorate_name || selectedOrder.governorate} - {selectedOrder.markaz_name || selectedOrder.center}
+                      {selectedOrder.delivery_area_name ? ` - ${selectedOrder.delivery_area_name}` : ''}
                     </div>
                     <div className="text-neutral-700 leading-relaxed">{selectedOrder.detailed_address}</div>
                     {selectedOrder.delivery_notes && (
@@ -4802,50 +5262,98 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Financial Summary */}
-                <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200/80 space-y-2">
-                  <h4 className="font-bold text-sm text-neutral-900 border-b border-neutral-200 pb-1.5">
-                    الملخص المالي للفاتورة:
-                  </h4>
-                  <div className="space-y-1 text-xs">
-                    <div className="flex justify-between text-neutral-600">
-                      <span>إجمالي المنتجات الأصلي (التقديري):</span>
-                      <span className="font-mono">{Number(selectedOrder.subtotal).toFixed(2)} ج.م</span>
-                    </div>
-
-                    {(selectedOrder.status === 'shopping_completed' || selectedOrder.status === 'completed') && (
-                      <div className="flex justify-between text-purple-900 font-bold bg-purple-50/70 p-1.5 rounded-lg border border-purple-200">
-                        <span>إجمالي المنتجات الفعلي بعد التسوق:</span>
-                        <span className="font-mono">
-                          {Number(selectedOrder.actual_items_total ?? selectedOrder.subtotal).toFixed(2)} ج.م
-                        </span>
-                      </div>
-                    )}
-
-                    <div className="flex justify-between text-neutral-600">
-                      <span>رسوم التوصيل:</span>
-                      <span className="font-mono">{Number(selectedOrder.delivery_fee).toFixed(2)} ج.م</span>
-                    </div>
-
-                    <div className="flex justify-between text-neutral-900 pt-2 border-t border-neutral-200 text-sm font-bold">
-                      {selectedOrder.status === 'shopping_completed' || selectedOrder.status === 'completed' ? (
-                        <>
-                          <span>المبلغ الفعلي المطلوب تحصيله:</span>
-                          <span className="text-emerald-700 font-extrabold font-mono text-base">
-                            {Number(selectedOrder.actual_total_amount ?? selectedOrder.total_amount).toFixed(2)} ج.م
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <span>الإجمالي المطلوب تقديريًا:</span>
-                          <span className="text-neutral-800 font-mono">
-                            {Number(selectedOrder.total_amount).toFixed(2)} ج.م
-                          </span>
-                        </>
+                {/* Financial Summary (Stored DB fields only - zero computed fallback) */}
+                {(() => {
+                  const fin = extractOrderFinancialBreakdown(selectedOrder);
+                  return (
+                    <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200/80 space-y-2">
+                      <h4 className="font-bold text-sm text-neutral-900 border-b border-neutral-200 pb-1.5">
+                        الملخص المالي للفاتورة:
+                      </h4>
+                      {fin.hasIncompleteFinancials && (
+                        <div className="p-2 rounded-lg bg-amber-50 border border-amber-200 text-[11px] font-bold text-amber-900">
+                          البيانات المالية غير مكتملة
+                        </div>
                       )}
+                      <div className="space-y-1 text-xs">
+                        <div className="flex justify-between text-neutral-600">
+                          <span>إجمالي المنتجات الأصلي (التقديري):</span>
+                          <span className="font-mono">
+                            {fin.subtotal != null ? `${fin.subtotal.toFixed(2)} ج.م` : 'غير متوفر'}
+                          </span>
+                        </div>
+
+                        {(selectedOrder.status === 'shopping_completed' || selectedOrder.status === 'completed') && (
+                          <div className="flex justify-between text-purple-900 font-bold bg-purple-50/70 p-1.5 rounded-lg border border-purple-200">
+                            <span>إجمالي المنتجات الفعلي بعد التسوق:</span>
+                            <span className="font-mono">
+                              {fin.actualItemsTotal != null
+                                ? `${fin.actualItemsTotal.toFixed(2)} ج.م`
+                                : fin.subtotal != null
+                                ? `${fin.subtotal.toFixed(2)} ج.م`
+                                : 'غير متوفر'}
+                            </span>
+                          </div>
+                        )}
+
+                        <div className="flex justify-between text-neutral-600">
+                          <span>رسوم التوصيل (delivery_fee):</span>
+                          <span className="font-mono">
+                            {fin.deliveryFee != null ? `${fin.deliveryFee.toFixed(2)} ج.م` : 'غير متوفر'}
+                          </span>
+                        </div>
+
+                        {fin.deliveryBaseFee != null && (
+                          <div className="flex justify-between text-neutral-600">
+                            <span>الرسوم الأساسية للتوصيل (delivery_base_fee):</span>
+                            <span className="font-mono">{fin.deliveryBaseFee.toFixed(2)} ج.م</span>
+                          </div>
+                        )}
+
+                        {fin.customerDeliveryFee != null && (
+                          <div className="flex justify-between text-neutral-600">
+                            <span>رسوم التوصيل على العميل (customer_delivery_fee):</span>
+                            <span className="font-mono">{fin.customerDeliveryFee.toFixed(2)} ج.م</span>
+                          </div>
+                        )}
+
+                        {fin.deliveryAdminCommission != null && (
+                          <div className="flex justify-between text-neutral-600">
+                            <span>عمولة الإدارة (delivery_admin_commission):</span>
+                            <span className="font-mono">{fin.deliveryAdminCommission.toFixed(2)} ج.م</span>
+                          </div>
+                        )}
+
+                        {fin.deliveryDriverNet != null && (
+                          <div className="flex justify-between text-emerald-700 font-bold">
+                            <span>صافي ربح السائق (delivery_driver_net):</span>
+                            <span className="font-mono">{fin.deliveryDriverNet.toFixed(2)} ج.م</span>
+                          </div>
+                        )}
+
+                        <div className="flex justify-between text-neutral-900 pt-2 border-t border-neutral-200 text-sm font-bold">
+                          {selectedOrder.status === 'shopping_completed' || selectedOrder.status === 'completed' ? (
+                            <>
+                              <span>المبلغ الفعلي المطلوب تحصيله:</span>
+                              <span className="text-emerald-700 font-extrabold font-mono text-base">
+                                {fin.actualTotalAmount != null || fin.totalAmount != null
+                                  ? `${Number(fin.actualTotalAmount ?? fin.totalAmount).toFixed(2)} ج.م`
+                                  : 'غير متوفر'}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span>الإجمالي المطلوب تقديريًا:</span>
+                              <span className="text-neutral-800 font-mono">
+                                {fin.totalAmount != null ? `${fin.totalAmount.toFixed(2)} ج.م` : 'غير متوفر'}
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                </div>
+                  );
+                })()}
 
                 {/* Status History */}
                 <div className="space-y-3">
@@ -4884,6 +5392,15 @@ export default function App() {
                       <span>اتصال بالعميل</span>
                     </button>
                   )}
+
+                  <button
+                    type="button"
+                    onClick={() => setMapModalTarget({ order: selectedOrder, orderType: 'regular' })}
+                    className="px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
+                  >
+                    <MapPin className="w-3.5 h-3.5 text-emerald-700" />
+                    <span>الخريطة والملاحة</span>
+                  </button>
                 </div>
 
                 <div className="flex items-center space-x-2 space-x-reverse">
@@ -5131,6 +5648,22 @@ export default function App() {
         deliveryStatus={deliveryRealtimeStatus}
         deliveryError={deliveryRealtimeError}
         deliveryLastEventTime={deliveryLastEventTime}
+      />
+
+      {/* Order GPS & External Navigation Modal */}
+      <OrderMapModal
+        isOpen={Boolean(mapModalTarget)}
+        onClose={() => setMapModalTarget(null)}
+        order={mapModalTarget?.order || null}
+        orderType={mapModalTarget?.orderType || 'regular'}
+        driverLocation={driverLocation}
+        gpsStatus={gpsStatus}
+        gpsErrorMessage={gpsErrorMessage}
+        isLoadingGPS={isLoadingGPS}
+        systemSettings={systemSettings}
+        isTrackingActive={isTrackingActive}
+        lastTrackingResult={lastTrackingResult}
+        onRefreshGPS={() => requestGPSLocation(false)}
       />
     </div>
   );

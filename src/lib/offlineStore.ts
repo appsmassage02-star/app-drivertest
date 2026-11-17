@@ -218,7 +218,7 @@ export async function syncOfflineQueue(
           rpcParams = { p_order_id: item.orderId };
           break;
         case 'delivery_update_item':
-          rpcName = 'driver_update_order_item';
+          rpcName = 'driver_update_delivery_item';
           rpcParams = item.payload;
           break;
         case 'delivery_complete':
