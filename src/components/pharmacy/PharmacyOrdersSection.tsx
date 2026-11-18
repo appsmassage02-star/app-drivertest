@@ -7,18 +7,24 @@ import { PharmacyOrderDetailsModal } from './PharmacyOrderDetailsModal';
 import { PharmacyCancellationModal } from './PharmacyCancellationModal';
 import type { DeliveryDriver } from '../../App';
 import type { AppSectionSettingsState, CentralGeoContext } from '../../types';
+import type { DriverGPSLocation } from '../../lib/gpsService';
 import { evaluateSectionOperationalStatus } from '../../lib/sectionSettingsService';
+import { sortOrdersOldestFirst } from '../../lib/orderDisplayHelpers';
 
 interface PharmacyOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
   searchQuery: string;
   currentDriver: DeliveryDriver | null;
+  driverLocation?: DriverGPSLocation | null;
+  hideCardsList?: boolean;
   isWorking?: boolean;
   deliveryEnabled: boolean;
   geoContext?: CentralGeoContext | null;
   sectionSettings?: AppSectionSettingsState | null;
   pharmacyOrders: PharmacyOrder[];
   selectedPharmacyOrder: PharmacyOrder | null;
+  cancellationTargetOrderOverride?: PharmacyOrder | null;
+  onChangeCancellationTargetOrder?: (order: PharmacyOrder | null) => void;
   isPharmacyLoading: boolean;
   isPharmacyActionLoading: boolean;
   isPharmacyRealtimeActive: boolean;
@@ -76,12 +82,16 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   activeTab,
   searchQuery,
   currentDriver,
+  driverLocation = null,
+  hideCardsList = false,
   isWorking = true,
   deliveryEnabled,
   geoContext = null,
   sectionSettings = null,
   pharmacyOrders,
   selectedPharmacyOrder,
+  cancellationTargetOrderOverride,
+  onChangeCancellationTargetOrder,
   isPharmacyLoading,
   isPharmacyActionLoading,
   isPharmacyRealtimeActive,
@@ -105,7 +115,19 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   onCallCustomer,
   onOpenMap,
 }) => {
-  const [cancellationTargetOrder, setCancellationTargetOrder] = useState<PharmacyOrder | null>(null);
+  const [internalCancellationTargetOrder, setInternalCancellationTargetOrder] =
+    useState<PharmacyOrder | null>(null);
+  const cancellationTargetOrder =
+    cancellationTargetOrderOverride !== undefined
+      ? cancellationTargetOrderOverride
+      : internalCancellationTargetOrder;
+  const setCancellationTargetOrder = (ord: PharmacyOrder | null) => {
+    if (onChangeCancellationTargetOrder) {
+      onChangeCancellationTargetOrder(ord);
+    } else {
+      setInternalCancellationTargetOrder(ord);
+    }
+  };
 
   const pharmacySectionEval = useMemo(
     () =>
@@ -174,7 +196,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
       );
     }
 
-    return list;
+    return sortOrdersOldestFirst(list);
   }, [
     pharmacyOrders,
     activeTab,
@@ -233,122 +255,88 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
         </div>
       )}
 
-      {/* Pharmacy Section Header Banner */}
-      <div className="bg-gradient-to-l from-teal-900 via-teal-800 to-emerald-800 text-white rounded-2xl p-4 shadow-xs flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center space-x-3 space-x-reverse">
-          <div className="w-10 h-10 rounded-xl bg-white/15 border border-white/20 flex items-center justify-center shrink-0">
-            <Pill className="w-5 h-5 text-teal-200" />
-          </div>
-          <div>
-            <div className="flex items-center space-x-2 space-x-reverse">
-              <h3 className="font-extrabold text-sm sm:text-base">قسم فواتير الصيدلية</h3>
-              <span className="px-2 py-0.5 rounded-full bg-teal-400/20 border border-teal-300/30 text-teal-100 text-[10px] font-bold">
-                {filteredPharmacyOrders.length} طلب
-              </span>
+      {/* Pharmacy Section Header & Cards Grid (hidden when unified chronological grid renders cards) */}
+      {!hideCardsList && (
+        <>
+          <div className="bg-white border border-emerald-200/80 text-slate-900 rounded-2xl p-3.5 px-4 shadow-2xs flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-center shrink-0 text-emerald-700">
+                <Pill className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-extrabold text-sm text-slate-900">فواتير الصيدلية</h3>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold tabular-nums">
+                    {filteredPharmacyOrders.length} طلب
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  مرتبة من الأقدم إلى الأحدث
+                </p>
+              </div>
             </div>
-            <p className="text-[11px] text-teal-100/90">
-              استقبال وتجهيز طلبات الأدوية والروشتات الطبية وتوصيلها للعملاء
-            </p>
+
+            <div className="flex items-center gap-2">
+              {onOpenDiagnostics && (
+                <button
+                  type="button"
+                  onClick={onOpenDiagnostics}
+                  className="p-2 rounded-xl bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 transition cursor-pointer flex items-center justify-center"
+                  title="سجلات وتشخيص البث اللحظي (Realtime Diagnostics)"
+                >
+                  <Activity className="w-4 h-4" />
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => onRefreshPharmacyOrders()}
+                disabled={isPharmacyLoading}
+                className="p-2 rounded-xl bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 transition cursor-pointer"
+                title="تحديث فواتير الصيدلية"
+              >
+                <RefreshCw className={`w-4 h-4 ${isPharmacyLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div className="flex items-center space-x-2 space-x-reverse">
-          <span
-            className={`inline-flex items-center space-x-1.5 space-x-reverse px-2.5 py-1 rounded-full text-[10px] font-bold border transition ${
-              realtimeStatus === 'SUBSCRIBED' || (!realtimeStatus && isPharmacyRealtimeActive)
-                ? 'bg-emerald-500/20 text-emerald-100 border-emerald-400/40'
-                : realtimeStatus === 'CONNECTING'
-                ? 'bg-amber-500/20 text-amber-100 border-amber-400/40'
-                : realtimeStatus === 'CHANNEL_ERROR'
-                ? 'bg-rose-500/20 text-rose-100 border-rose-400/40'
-                : 'bg-white/10 text-white/70 border-white/20'
-            }`}
-            title={`حالة Realtime: ${realtimeStatus || (isPharmacyRealtimeActive ? 'SUBSCRIBED' : 'DISCONNECTED')}`}
-          >
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                realtimeStatus === 'SUBSCRIBED' || (!realtimeStatus && isPharmacyRealtimeActive)
-                  ? 'bg-emerald-400 animate-ping'
-                  : realtimeStatus === 'CONNECTING'
-                  ? 'bg-amber-400 animate-pulse'
-                  : realtimeStatus === 'CHANNEL_ERROR'
-                  ? 'bg-rose-400'
-                  : 'bg-neutral-300'
-              }`}
-            />
-            <span>
-              {realtimeStatus === 'SUBSCRIBED'
-                ? 'بث فوري (SUBSCRIBED)'
-                : realtimeStatus === 'CONNECTING'
-                ? 'جاري الاتصال...'
-                : realtimeStatus === 'CHANNEL_ERROR'
-                ? 'خطأ في القناة'
-                : realtimeStatus === 'CLOSED'
-                ? 'مغلق (CLOSED)'
-                : isPharmacyRealtimeActive
-                ? 'تحديث فوري'
-                : 'غير متصل'}
-            </span>
-          </span>
-
-          {onOpenDiagnostics && (
-            <button
-              type="button"
-              onClick={onOpenDiagnostics}
-              className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition cursor-pointer flex items-center justify-center"
-              title="سجلات وتشخيص البث اللحظي (Realtime Diagnostics)"
-            >
-              <Activity className="w-4 h-4" />
-            </button>
+          {filteredPharmacyOrders.length === 0 ? (
+            <div className="bg-white rounded-2xl p-10 text-center border border-slate-200 shadow-2xs">
+              <div className="w-12 h-12 rounded-2xl bg-emerald-50 flex items-center justify-center mx-auto mb-3 text-emerald-600">
+                <Pill className="w-6 h-6" />
+              </div>
+              <h4 className="text-sm font-extrabold text-slate-800">
+                لا توجد فواتير صيدلية في هذا التبويب حاليًا
+              </h4>
+              <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
+                {activeTab === 'pending'
+                  ? 'بمجرد وصول طلب روشتة أو فاتورة صيدلية جديدة في نطاقك الجغرافي ستظهر هنا بوضوح.'
+                  : 'لا توجد فواتير صيدلية مطابقة لهذا القسم.'}
+              </p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {filteredPharmacyOrders.map((order) => (
+                <PharmacyOrderCard
+                  key={order.id}
+                  order={order}
+                  currentDriverId={currentDriver?.id}
+                  driverLocation={driverLocation}
+                  canAccept={canAcceptBase && order.status === 'pending_review'}
+                  isWorking={isWorking}
+                  isActionLoading={isPharmacyActionLoading}
+                  onOpenDetails={(ord) => onSelectPharmacyOrder(ord)}
+                  onAcceptOrder={onAcceptOrder}
+                  onStartShopping={onStartShopping}
+                  onCompleteDelivery={onCompleteDelivery}
+                  onRequestCancellation={(ord) => setCancellationTargetOrder(ord)}
+                  onCallCustomer={onCallCustomer}
+                  onOpenMap={onOpenMap}
+                />
+              ))}
+            </div>
           )}
-
-          <button
-            type="button"
-            onClick={() => onRefreshPharmacyOrders()}
-            disabled={isPharmacyLoading}
-            className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition cursor-pointer"
-            title="تحديث فواتير الصيدلية"
-          >
-            <RefreshCw className={`w-4 h-4 ${isPharmacyLoading ? 'animate-spin' : ''}`} />
-          </button>
-        </div>
-      </div>
-
-      {/* Pharmacy Orders Grid */}
-      {filteredPharmacyOrders.length === 0 ? (
-        <div className="bg-white rounded-2xl p-10 text-center border-2 border-dashed border-teal-200 shadow-2xs">
-          <div className="w-14 h-14 rounded-2xl bg-teal-50 flex items-center justify-center mx-auto mb-3 text-teal-600">
-            <Pill className="w-7 h-7" />
-          </div>
-          <h4 className="text-sm font-extrabold text-neutral-800">
-            لا توجد فواتير صيدلية في هذا التبويب حاليًا
-          </h4>
-          <p className="text-xs text-neutral-500 mt-1 max-w-md mx-auto leading-relaxed">
-            {activeTab === 'pending'
-              ? 'بمجرد وصول طلب روشتة أو فاتورة صيدلية جديدة في نطاقك الجغرافي ستظهر هنا بوضوح.'
-              : 'لا توجد فواتير صيدلية مطابقة لهذا القسم.'}
-          </p>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {filteredPharmacyOrders.map((order) => (
-            <PharmacyOrderCard
-              key={order.id}
-              order={order}
-              currentDriverId={currentDriver?.id}
-              canAccept={canAcceptBase && order.status === 'pending_review'}
-              isWorking={isWorking}
-              isActionLoading={isPharmacyActionLoading}
-              onOpenDetails={(ord) => onSelectPharmacyOrder(ord)}
-              onAcceptOrder={onAcceptOrder}
-              onStartShopping={onStartShopping}
-              onCompleteDelivery={onCompleteDelivery}
-              onRequestCancellation={(ord) => setCancellationTargetOrder(ord)}
-              onCallCustomer={onCallCustomer}
-              onOpenMap={onOpenMap}
-            />
-          ))}
-        </div>
+        </>
       )}
 
       {/* Pharmacy Order Details & Preparation Modal */}

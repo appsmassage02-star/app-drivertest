@@ -40,19 +40,19 @@ const SECTION_ACCENT: Record<
   }
 > = {
   household_shortages: {
-    iconBg: 'bg-emerald-50 border-emerald-200',
-    iconText: 'text-emerald-700',
-    borderActive: 'border-neutral-200',
+    iconBg: 'bg-blue-50 border-blue-200',
+    iconText: 'text-blue-700',
+    borderActive: 'border-blue-200/80',
   },
   pharmacy: {
-    iconBg: 'bg-teal-50 border-teal-200',
-    iconText: 'text-teal-700',
-    borderActive: 'border-teal-200/80',
+    iconBg: 'bg-emerald-50 border-emerald-200',
+    iconText: 'text-emerald-700',
+    borderActive: 'border-emerald-200/80',
   },
   ready_food: {
-    iconBg: 'bg-amber-50 border-amber-200',
-    iconText: 'text-amber-700',
-    borderActive: 'border-amber-200/80',
+    iconBg: 'bg-orange-50 border-orange-200',
+    iconText: 'text-orange-700',
+    borderActive: 'border-orange-200/80',
   },
 };
 
@@ -88,19 +88,19 @@ export const SectionStatusPanel: React.FC<SectionStatusPanelProps> = ({
   return (
     <section
       aria-label="حالة تشغيل الأقسام وخدمات التوصيل"
-      className="bg-white border border-neutral-200 rounded-2xl p-4 shadow-2xs space-y-3"
+      className="bg-white border border-slate-200 rounded-3xl p-5 sm:p-6 shadow-xs space-y-4"
     >
       {/* Header Row */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center space-x-2 space-x-reverse">
-          <div className="w-8 h-8 rounded-xl bg-neutral-100 border border-neutral-200 flex items-center justify-center text-neutral-700 shrink-0">
-            <Truck className="w-4 h-4" />
+        <div className="flex items-center space-x-3 space-x-reverse">
+          <div className="w-10 h-10 rounded-2xl bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 shrink-0">
+            <Truck className="w-5 h-5" />
           </div>
           <div>
-            <h2 className="text-xs sm:text-sm font-extrabold text-neutral-900">
+            <h2 className="text-sm sm:text-base font-extrabold text-slate-900">
               حالة تشغيل الأقسام وخدمات التوصيل
             </h2>
-            <p className="text-[11px] text-neutral-500">
+            <p className="text-xs text-slate-500">
               قراءة مباشرة من الإعدادات المركزية — أي تعديل إداري يظهر هنا ويمنع استقبال طلبات جديدة من القسم المتوقف دون المساس بطلباتك القائمة
             </p>
           </div>
@@ -108,7 +108,7 @@ export const SectionStatusPanel: React.FC<SectionStatusPanelProps> = ({
 
         <div className="flex items-center space-x-2 space-x-reverse">
           {lastSyncedFormatted && (
-            <span className="text-[10px] font-semibold text-neutral-500 bg-neutral-50 border border-neutral-200 px-2 py-1 rounded-lg">
+            <span className="text-[11px] font-semibold text-slate-500 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
               آخر تحديث: {lastSyncedFormatted}
             </span>
           )}
@@ -117,9 +117,9 @@ export const SectionStatusPanel: React.FC<SectionStatusPanelProps> = ({
               type="button"
               onClick={onRefresh}
               disabled={isRefreshing}
-              className="px-3 py-1.5 bg-neutral-100 hover:bg-neutral-200 active:scale-95 text-neutral-800 rounded-xl text-[11px] font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shrink-0 disabled:opacity-60"
+              className="min-h-[40px] px-3.5 py-2 bg-blue-50 hover:bg-blue-100 active:scale-95 text-blue-700 border border-blue-200 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shrink-0 disabled:opacity-60"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-emerald-700' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`} />
               <span>تحديث الحالة</span>
             </button>
           )}
