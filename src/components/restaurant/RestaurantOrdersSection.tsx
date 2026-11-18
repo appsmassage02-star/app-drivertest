@@ -1,9 +1,10 @@
-import React, { useMemo } from 'react';
-import { UtensilsCrossed, AlertTriangle, RefreshCw } from 'lucide-react';
-import { DeliveryOrder } from '../../types';
+import React from 'react';
+import { UtensilsCrossed, RefreshCw } from 'lucide-react';
+import { AppSectionSettingsState, DeliveryOrder } from '../../types';
 import { RestaurantOrderCard } from './RestaurantOrderCard';
 import { RestaurantOrderDetailsModal } from './RestaurantOrderDetailsModal';
 import type { DeliveryDriver } from '../../App';
+import { evaluateSectionOperationalStatus } from '../../lib/sectionSettingsService';
 
 interface RestaurantOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
@@ -11,6 +12,7 @@ interface RestaurantOrdersSectionProps {
   currentDriver: DeliveryDriver | null;
   isWorking?: boolean;
   deliveryEnabled: boolean;
+  sectionSettings?: AppSectionSettingsState | null;
   restaurantOrders: DeliveryOrder[];
   selectedRestaurantOrder: DeliveryOrder | null;
   isActionLoading: boolean;
@@ -34,10 +36,10 @@ interface RestaurantOrdersSectionProps {
 
 export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = ({
   activeTab,
-  searchQuery,
   currentDriver,
   isWorking = true,
   deliveryEnabled,
+  sectionSettings = null,
   restaurantOrders,
   selectedRestaurantOrder,
   isActionLoading,
@@ -57,14 +59,39 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
     return null;
   }
 
+  const readyFoodSectionEval = sectionSettings
+    ? evaluateSectionOperationalStatus(sectionSettings, 'ready_food')
+    : null;
+  const isReadyFoodOperational = readyFoodSectionEval
+    ? readyFoodSectionEval.canShowNewOrders
+    : true;
+
   const canAcceptBase =
     Boolean(isWorking) &&
     Boolean(deliveryEnabled) &&
+    isReadyFoodOperational &&
     currentDriver?.status === 'approved' &&
     Boolean(currentDriver?.is_active);
 
   return (
     <div className="space-y-4">
+      {/* Restaurant Section Stopped Notice (Only on pending tab; ongoing assigned orders remain active) */}
+      {activeTab === 'pending' && readyFoodSectionEval && !readyFoodSectionEval.canShowNewOrders && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 flex items-center space-x-3 space-x-reverse text-rose-950 shadow-2xs">
+          <div className="w-10 h-10 rounded-xl bg-rose-100 border border-rose-200 flex items-center justify-center shrink-0 text-rose-700">
+            <UtensilsCrossed className="w-5 h-5" />
+          </div>
+          <div className="text-xs leading-relaxed">
+            <strong className="block text-rose-950 font-extrabold text-sm mb-0.5">
+              استقبال طلبات المطاعم الجديدة متوقف حاليًا
+            </strong>
+            <span>
+              {readyFoodSectionEval.reason} (الطلبات المقبولة مسبقًا لا تتأثر وتستمر عبر تبويب «قيد التنفيذ»).
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Work Availability Notice for Restaurant Orders */}
       {activeTab === 'pending' && !isWorking && (
         <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 flex items-center space-x-3 space-x-reverse text-amber-950 shadow-2xs">

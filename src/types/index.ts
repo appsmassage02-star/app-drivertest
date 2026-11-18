@@ -358,6 +358,45 @@ export interface DeliverySystemSettings {
   failedOperation?: DbFailedOperation | null;
 }
 
+export type AppSectionKey = 'household_shortages' | 'pharmacy' | 'ready_food';
+
+export type AppSectionRowLoadState =
+  | 'idle'
+  | 'loaded'
+  | 'missing_row'
+  | 'invalid_row'
+  | 'permission_denied'
+  | 'table_missing'
+  | 'error';
+
+export interface AppSectionSetting {
+  section_key: AppSectionKey;
+  label_ar: string;
+  short_label_ar: string;
+  section_enabled: boolean | null;
+  section_visible: boolean | null;
+  delivery_enabled: boolean | null;
+  load_state: AppSectionRowLoadState;
+  error_message?: string | null;
+  updated_at?: string | null;
+  raw_record?: Record<string, any> | null;
+}
+
+export interface AppSectionSettingsState {
+  load_state:
+    | 'idle'
+    | 'loaded'
+    | 'partial'
+    | 'empty'
+    | 'permission_denied'
+    | 'table_missing'
+    | 'error';
+  sections: Record<AppSectionKey, AppSectionSetting>;
+  lastSyncedAt: string | null;
+  errorMessage: string | null;
+  failedOperation?: DbFailedOperation | null;
+}
+
 export interface DriverLocationRecord {
   driver_id: string;
   latitude: number;

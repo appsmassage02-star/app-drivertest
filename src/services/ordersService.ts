@@ -7,6 +7,8 @@ import {
   OrderItem,
   CentralGeoContext,
   DeliveryDriver,
+  AppSectionSettingsState,
+  AppSectionKey,
 } from '../types';
 import { getSupabaseClient, isSupabaseConfigured, subscribeToRealtimeChanges } from './supabaseClient';
 import {
@@ -14,6 +16,12 @@ import {
   extractOrderFinancialBreakdown,
   loadFullCentralGeoContext,
 } from '../lib/geoCoverageService';
+import {
+  createEmptyAppSectionSettingsState,
+  evaluateSectionOperationalStatus,
+  fetchAppSectionSettings,
+  resolveOrderSectionKey,
+} from '../lib/sectionSettingsService';
 
 // Helper to normalize delivery order status from DB
 function normalizeOrderStatus(rawStatus: any): OrderStatus {
@@ -81,6 +89,7 @@ class OrdersService {
   private currentDriverRecord: DeliveryDriver | null = null;
   private currentDriverZone: { governorate?: string; center?: string } = {};
   private centralGeoContext: CentralGeoContext | null = null;
+  private sectionSettings: AppSectionSettingsState = createEmptyAppSectionSettingsState('idle');
 
   // Browser event handler bindings
   private onOnlineBound: () => void;
@@ -154,6 +163,10 @@ class OrdersService {
 
   public getLastSyncError(): string | null {
     return this.lastSyncError;
+  }
+
+  public getSectionSettings(): AppSectionSettingsState {
+    return this.sectionSettings;
   }
 
   // Browser event listeners setup
@@ -275,6 +288,13 @@ class OrdersService {
       (payload) => handleRealtimeTrigger('delivery_drivers', payload)
     );
     if (unsubDrivers) this.realtimeUnsubscribes.push(unsubDrivers);
+
+    // 4. Central section & delivery operational settings
+    const unsubSectionSettings = subscribeToRealtimeChanges(
+      'app_section_settings',
+      (payload) => handleRealtimeTrigger('app_section_settings', payload)
+    );
+    if (unsubSectionSettings) this.realtimeUnsubscribes.push(unsubSectionSettings);
   }
 
   private cleanupRealtime(): void {
@@ -358,12 +378,13 @@ class OrdersService {
         console.warn('[OrdersService] Could not resolve driver session from auth:', err);
       }
 
-      // 1b. Load authoritative central geo hierarchy & driver coverage
-      if (driverRecord) {
-        this.centralGeoContext = await loadFullCentralGeoContext(client, driverRecord);
-      } else {
-        this.centralGeoContext = null;
-      }
+      // 1b. Load authoritative central geo hierarchy, driver coverage & central section settings directly from DB (no stale cache)
+      const [loadedSectionSettings, loadedGeoContext] = await Promise.all([
+        fetchAppSectionSettings(client),
+        driverRecord ? loadFullCentralGeoContext(client, driverRecord) : Promise.resolve(null),
+      ]);
+      this.sectionSettings = loadedSectionSettings;
+      this.centralGeoContext = loadedGeoContext;
 
       // 2. Fetch Regular & Restaurant Orders from "delivery_orders"
       const { regularOrdersList, historyFromRegular } = await this.fetchDeliveryOrdersFromDB(
@@ -476,10 +497,17 @@ class OrdersService {
           continue;
         }
 
-        // 2. If unassigned, must be in acceptable state and match central geo coverage IDs
+        // 2. If unassigned, must be in acceptable state, belong to an operational section, and match central geo coverage IDs
         if (!assignedDriverId) {
           if (orderStatus === 'delivered' || orderStatus === 'cancelled') {
             continue;
+          }
+          if (this.sectionSettings.load_state !== 'idle') {
+            const sectionKey = resolveOrderSectionKey(row);
+            const secEval = evaluateSectionOperationalStatus(this.sectionSettings, sectionKey);
+            if (!secEval.canShowNewOrders) {
+              continue;
+            }
           }
           if (driverRecord) {
             const matchRes = evaluateCentralCoverageMatch(row, driverRecord, geoContext);
@@ -777,11 +805,17 @@ class OrdersService {
           continue;
         }
 
-        // 2. If unassigned, check central geo IDs if explicitly present on pharmacy_orders;
-        // otherwise preserve existing pharmacy flow until backend adds central geo IDs to pharmacy_orders
+        // 2. If unassigned, verify pharmacy section is operational AND check geo IDs if explicitly present on pharmacy_orders;
+        // otherwise preserve existing pharmacy flow cleanly
         if (!assignedDriverId) {
           if (orderStatus === 'delivered' || orderStatus === 'cancelled') {
             continue;
+          }
+          if (this.sectionSettings.load_state !== 'idle') {
+            const pharmacySecEval = evaluateSectionOperationalStatus(this.sectionSettings, 'pharmacy');
+            if (!pharmacySecEval.canShowNewOrders) {
+              continue;
+            }
           }
           const hasCentralIds = Boolean(
             row.address_area_id || row.address_center_id || row.address_governorate_id
@@ -1116,6 +1150,28 @@ class OrdersService {
     // 1. If Supabase is connected, execute server RPC FIRST
     if (client && isSupabaseConfigured()) {
       try {
+        // Fresh live verification of central section status right before accepting any new order
+        if (newStatus === 'accepted') {
+          const freshSectionSettings = await fetchAppSectionSettings(client);
+          this.sectionSettings = freshSectionSettings;
+          let targetSectionKey: AppSectionKey = 'household_shortages';
+          if (type === 'pharmacy') {
+            targetSectionKey = 'pharmacy';
+          } else if (type === 'restaurant') {
+            targetSectionKey = 'ready_food';
+          } else {
+            const existingOrder = this.regularOrders.find((o) => o.id === orderId);
+            if (existingOrder) {
+              targetSectionKey = resolveOrderSectionKey(existingOrder);
+            }
+          }
+          const secEval = evaluateSectionOperationalStatus(freshSectionSettings, targetSectionKey);
+          if (!secEval.canAcceptNewOrders) {
+            this.lastSyncError = secEval.reason;
+            return false;
+          }
+        }
+
         if (type === 'pharmacy') {
           if (newStatus === 'accepted') {
             const { error } = await client.rpc('pharmacy_driver_accept_order', {

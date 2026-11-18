@@ -77,10 +77,18 @@ import {
   extractOrderFinancialBreakdown,
 } from './lib/geoCoverageService';
 import { fetchDeliverySystemSettings } from './lib/driverTrackingService';
+import {
+  createEmptyAppSectionSettingsState,
+  evaluateSectionOperationalStatus,
+  fetchAppSectionSettings,
+  resolveOrderSectionKey,
+} from './lib/sectionSettingsService';
+import { SectionStatusPanel } from './components/SectionStatusPanel';
 import { usePharmacy } from './hooks/usePharmacy';
 import { useDriverAuth } from './hooks/useDriverAuth';
 import { useDriverGPS } from './hooks/useDriverGPS';
 import type {
+  AppSectionSettingsState,
   CentralGeoContext,
   DeliveryDriver,
   DeliverySystemSettings,
@@ -377,6 +385,14 @@ export default function App() {
     load_state: 'idle',
   });
 
+  // Central Sections & Delivery Operational Settings State (read directly from public.app_section_settings, no localStorage cache)
+  const [sectionSettings, setSectionSettings] = useState<AppSectionSettingsState>(() =>
+    createEmptyAppSectionSettingsState('idle')
+  );
+  const sectionSettingsRef = useRef<AppSectionSettingsState>(sectionSettings);
+  sectionSettingsRef.current = sectionSettings;
+  const [isRefreshingSections, setIsRefreshingSections] = useState(false);
+
   // Memoized available governorates and centers for registration form (prefer central DB geo tables)
   const registrationGovernorates = useMemo(() => {
     const activeCentralGovs = regGeoHierarchy.governorates.filter((g) => g.is_active !== false);
@@ -550,6 +566,11 @@ export default function App() {
     isWorking,
     deliveryEnabled: Boolean(settings?.delivery_enabled),
     geoContext: centralGeoContext,
+    sectionSettings,
+    onSectionSettingsRefreshed: (fresh) => {
+      sectionSettingsRef.current = fresh;
+      setSectionSettings(fresh);
+    },
     onToast: showToast,
   });
 
@@ -617,6 +638,20 @@ export default function App() {
     return null;
   };
 
+  // Direct fresh read of app_section_settings (zero stale cache)
+  const refreshSectionSettings = useCallback(async () => {
+    const supabase = getClient();
+    if (!supabase || !navigator.onLine) return;
+    setIsRefreshingSections(true);
+    try {
+      const fresh = await fetchAppSectionSettings(supabase);
+      sectionSettingsRef.current = fresh;
+      setSectionSettings(fresh);
+    } finally {
+      setIsRefreshingSections(false);
+    }
+  }, []);
+
   // Sync App Settings and Driver Profile from Supabase (Delivery order fetching removed in Phase 1 pending Phase 2 replacement)
   const syncWithSupabase = useCallback(async (userId?: string) => {
     const supabase = getClient();
@@ -633,16 +668,17 @@ export default function App() {
         setHeaderImageSrc(newHeaderSrc);
       });
 
-      // 1. Fetch delivery_settings + delivery_system_settings + central geo coverage
+      // 1. Fetch delivery_settings + delivery_system_settings + app_section_settings + central geo coverage
       const activeDriver = currentDriverRef.current;
 
-      const [settingsRes, govSettingsRes, sysSettings, loadedGeoContext] = await Promise.all([
+      const [settingsRes, govSettingsRes, sysSettings, loadedSectionSettings, loadedGeoContext] = await Promise.all([
         supabase.from('delivery_settings').select('*').limit(1).maybeSingle(),
         supabase
           .from('delivery_governorate_settings')
           .select('*')
           .order('governorate_name', { ascending: true }),
         fetchDeliverySystemSettings(supabase),
+        fetchAppSectionSettings(supabase),
         activeDriver
           ? loadFullCentralGeoContext(supabase, activeDriver)
           : Promise.resolve(createEmptyCentralGeoContext()),
@@ -657,6 +693,8 @@ export default function App() {
       }
 
       setSystemSettings(sysSettings);
+      sectionSettingsRef.current = loadedSectionSettings;
+      setSectionSettings(loadedSectionSettings);
       centralGeoContextRef.current = loadedGeoContext;
       setCentralGeoContext(loadedGeoContext);
 
@@ -832,7 +870,7 @@ export default function App() {
     };
   }, [supabaseUser?.id]);
 
-  // Synchronize orders when driver becomes approved and active
+  // Synchronize orders and section statuses when driver becomes approved and active
   useEffect(() => {
     if (authStatus === 'approved_active') {
       void syncWithSupabase();
@@ -846,10 +884,17 @@ export default function App() {
         max_accepted_gps_accuracy_m: null,
         load_state: 'idle',
       });
+      if (supabaseUser?.id) {
+        void refreshSectionSettings();
+      } else {
+        const idleSections = createEmptyAppSectionSettingsState('idle');
+        sectionSettingsRef.current = idleSections;
+        setSectionSettings(idleSections);
+      }
     }
-  }, [authStatus, syncWithSupabase]);
+  }, [authStatus, supabaseUser?.id, syncWithSupabase, refreshSectionSettings]);
 
-  // Setup Realtime and central assets sync
+  // Setup Realtime and central assets + central app_section_settings sync
   useEffect(() => {
     const supabase = getClient();
     if (!supabase) return;
@@ -897,12 +942,29 @@ export default function App() {
       )
       .subscribe();
 
+    // Realtime subscription for central section operational settings (app_section_settings)
+    const sectionSettingsChannel = supabase
+      .channel('driver_app_section_settings_realtime')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'app_section_settings' },
+        () => {
+          if (!isMounted) return;
+          void refreshSectionSettings();
+          if (authStatus === 'approved_active') {
+            void syncWithSupabase();
+          }
+        }
+      )
+      .subscribe();
+
     return () => {
       isMounted = false;
       supabase.removeChannel(assetsChannel);
+      supabase.removeChannel(sectionSettingsChannel);
       unsubOrders();
     };
-  }, [authStatus, syncWithSupabase]);
+  }, [authStatus, syncWithSupabase, refreshSectionSettings]);
 
   // Sync driver session with ordersService
   useEffect(() => {
@@ -949,6 +1011,7 @@ export default function App() {
     const handleOnline = () => {
       setIsOnline(true);
       showToast('⚡ تم استعادة الاتصال بالإنترنت! جاري مزامنة العمليات المعلقة...', 'info');
+      void refreshSectionSettings();
       void triggerOfflineQueueSync();
       void syncWithSupabase();
     };
@@ -969,7 +1032,7 @@ export default function App() {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, [currentDriver, triggerOfflineQueueSync, syncWithSupabase, showToast]);
+  }, [currentDriver, refreshSectionSettings, triggerOfflineQueueSync, syncWithSupabase, showToast]);
 
   // -------------------------------------------------------------
   // Driver Work Availability & Heartbeat Management
@@ -1088,16 +1151,26 @@ export default function App() {
     };
   }, [isWorking, sendHeartbeat]);
 
-  // Immediate Heartbeat when returning to foreground
+  // Immediate Heartbeat + Fresh Section Settings/Sync when returning to foreground or focus (prevents stale cache)
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && isWorkingRef.current) {
-        console.log('[Heartbeat] App resumed to foreground, triggering immediate heartbeat');
-        void sendHeartbeat();
+      if (document.visibilityState === 'visible') {
+        void refreshSectionSettings();
+        if (currentDriverRef.current?.status === 'approved' && currentDriverRef.current?.is_active) {
+          void syncWithSupabase();
+        }
+        if (isWorkingRef.current) {
+          console.log('[Heartbeat] App resumed to foreground, triggering immediate heartbeat');
+          void sendHeartbeat();
+        }
       }
     };
 
     const handleFocus = () => {
+      void refreshSectionSettings();
+      if (currentDriverRef.current?.status === 'approved' && currentDriverRef.current?.is_active) {
+        void syncWithSupabase();
+      }
       if (isWorkingRef.current) {
         void sendHeartbeat();
       }
@@ -1110,7 +1183,7 @@ export default function App() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleFocus);
     };
-  }, [sendHeartbeat]);
+  }, [sendHeartbeat, refreshSectionSettings, syncWithSupabase]);
 
   // Start Work: set_driver_availability(p_is_available: true)
   const handleStartWork = async () => {
@@ -1557,6 +1630,9 @@ export default function App() {
       max_accepted_gps_accuracy_m: null,
       load_state: 'idle',
     });
+    const idleSections = createEmptyAppSectionSettingsState('idle');
+    sectionSettingsRef.current = idleSections;
+    setSectionSettings(idleSections);
     showToast('تم تسجيل الخروج ومسح بيانات الجلسة المحلية بأمان.');
   };
 
@@ -1652,6 +1728,7 @@ export default function App() {
       isWorking,
       deliveryEnabled: Boolean(settings?.delivery_enabled),
       geoContext: centralGeoContextRef.current,
+      sectionSettings: sectionSettingsRef.current,
     });
     if (!centralEligibility.matched) {
       showToast(
@@ -1672,6 +1749,21 @@ export default function App() {
       const supabase = getClient();
       if (!supabase) {
         showToast('الاتصال بـ Supabase غير مهيأ.', 'error');
+        return;
+      }
+
+      // Live pre-RPC verification directly from app_section_settings (zero stale cache bypass)
+      const freshSectionSettings = await fetchAppSectionSettings(supabase);
+      sectionSettingsRef.current = freshSectionSettings;
+      setSectionSettings(freshSectionSettings);
+
+      const targetSectionKey = resolveOrderSectionKey(order);
+      const freshSecEval = evaluateSectionOperationalStatus(
+        freshSectionSettings,
+        targetSectionKey
+      );
+      if (!freshSecEval.canAcceptNewOrders) {
+        showToast(freshSecEval.reason, 'error');
         return;
       }
 
@@ -2242,13 +2334,14 @@ export default function App() {
     syncWithSupabase();
   };
 
-  // Filtered Orders for the active view tab (pending orders strictly gated by central coverage & active work eligibility)
+  // Filtered Orders for the active view tab (pending orders strictly gated by central coverage, active work & section operational status)
   const filteredOrders = useMemo(() => {
     let list = [...orders];
     const eligibilityCtx = {
       isWorking,
       deliveryEnabled: Boolean(settings?.delivery_enabled),
       geoContext: centralGeoContext,
+      sectionSettings,
     };
 
     if (activeTab === 'pending') {
@@ -2296,7 +2389,7 @@ export default function App() {
     }
 
     return list;
-  }, [orders, activeTab, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext, searchQuery]);
+  }, [orders, activeTab, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext, sectionSettings, searchQuery]);
 
   // Separate Home (Regular) vs Restaurant orders
   const filteredHomeOrders = useMemo(() => {
@@ -2314,6 +2407,7 @@ export default function App() {
       isWorking,
       deliveryEnabled: Boolean(settings?.delivery_enabled),
       geoContext: centralGeoContext,
+      sectionSettings,
     };
     return {
       pending: homeList.filter(
@@ -2340,7 +2434,7 @@ export default function App() {
               evaluateCentralCoverageMatch(o, currentDriver, centralGeoContext).matched))
       ).length,
     };
-  }, [orders, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext]);
+  }, [orders, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext, sectionSettings]);
 
   // Restaurant Order Counts
   const restaurantCounts = useMemo(() => {
@@ -2351,6 +2445,7 @@ export default function App() {
       isWorking,
       deliveryEnabled: Boolean(settings?.delivery_enabled),
       geoContext: centralGeoContext,
+      sectionSettings,
     };
     return {
       pending: restList.filter(
@@ -2377,7 +2472,13 @@ export default function App() {
               evaluateCentralCoverageMatch(o, currentDriver, centralGeoContext).matched))
       ).length,
     };
-  }, [orders, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext]);
+  }, [orders, currentDriver, isWorking, settings?.delivery_enabled, centralGeoContext, sectionSettings]);
+
+  // Evaluated status for household_shortages section (used for banner & regular card acceptance guard)
+  const householdSectionEval = useMemo(
+    () => evaluateSectionOperationalStatus(sectionSettings, 'household_shortages'),
+    [sectionSettings]
+  );
 
   // Keep 'counts' as alias to homeCounts for backwards compatibility
   const counts = homeCounts;
@@ -3687,6 +3788,21 @@ export default function App() {
           </div>
         )}
 
+        {/* Central Sections & Delivery Operational Status Panel */}
+        {currentDriver && currentDriver.status === 'approved' && currentDriver.is_active && (
+          <SectionStatusPanel
+            sectionSettings={sectionSettings}
+            isRefreshing={isSyncing || isRefreshingSections}
+            onRefresh={() => {
+              void refreshSectionSettings();
+              if (authStatus === 'approved_active') {
+                void syncWithSupabase();
+              }
+            }}
+            globalDeliveryEnabled={settings?.delivery_enabled}
+          />
+        )}
+
         {/* Search Bar & Order Type Switcher (Regular Orders + Pharmacy Invoice) */}
         {['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab) && (
           <div className="space-y-3">
@@ -3810,6 +3926,7 @@ export default function App() {
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
               geoContext={centralGeoContext}
+              sectionSettings={sectionSettings}
               pharmacyOrders={pharmacyOrders}
               selectedPharmacyOrder={selectedPharmacyOrder}
               isPharmacyLoading={isPharmacyLoading}
@@ -3848,6 +3965,7 @@ export default function App() {
               currentDriver={currentDriver}
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
+              sectionSettings={sectionSettings}
               restaurantOrders={filteredRestaurantOrders}
               selectedRestaurantOrder={selectedRestaurantOrder}
               isActionLoading={isActionLoading}
@@ -3871,6 +3989,22 @@ export default function App() {
         {['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab) &&
           (orderCategoryView === 'all' || orderCategoryView === 'regular') && (
           <div className="space-y-4">
+            {activeTab === 'pending' && !householdSectionEval.canShowNewOrders && (
+              <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 flex items-center space-x-3 space-x-reverse text-rose-950 shadow-2xs">
+                <div className="w-10 h-10 rounded-xl bg-rose-100 border border-rose-200 flex items-center justify-center shrink-0 text-rose-700">
+                  <Package className="w-5 h-5" />
+                </div>
+                <div className="text-xs leading-relaxed">
+                  <strong className="block text-rose-950 font-extrabold text-sm mb-0.5">
+                    استقبال طلبات نواقص المنزل الجديدة متوقف حاليًا
+                  </strong>
+                  <span>
+                    {householdSectionEval.reason} (الطلبات المقبولة والمسندة إليك مسبقًا تبقى متاحة للاستكمال في تبويب «قيد التنفيذ»).
+                  </span>
+                </div>
+              </div>
+            )}
+
             {filteredHomeOrders.length === 0 ? (
               <div className="bg-white rounded-2xl p-12 text-center border border-neutral-200 shadow-xs">
                 <div className="w-16 h-16 rounded-2xl bg-neutral-100 flex items-center justify-center mx-auto mb-3 text-neutral-400">
@@ -3879,16 +4013,20 @@ export default function App() {
                 <h4 className="text-base font-bold text-neutral-800">
                   {activeTab === 'pending' && !isWorking
                     ? 'أنت متوقف عن العمل حاليًا'
+                    : activeTab === 'pending' && !householdSectionEval.canShowNewOrders
+                    ? 'استقبال الطلبات الجديدة لقسم نواقص المنزل متوقف حاليًا'
                     : 'لا توجد طلبات في هذا القسم'}
                 </h4>
                 <p className="text-xs text-neutral-500 mt-1 max-w-md mx-auto leading-relaxed">
                   {activeTab === 'pending'
                     ? !isWorking
                       ? 'أنت غير متاح لاستقبال أو قبول طلبات جديدة في منطقتك. اضغط على «بدء العمل» في الأعلى أو في البطاقة لتفعيل حالتك واستقبال الطلبات.'
+                      : !householdSectionEval.canShowNewOrders
+                      ? householdSectionEval.reason
                       : 'أنت متاح للعمل والنظام في وضع الاستعداد اللحظي. بمجرد أن يرسل أحد المنازل طلبًا جديدًا في منطقتك، سيظهر هنا فورًا.'
                     : 'بانتظار وصول وتحديث طلبات التوصيل من المنازل (Home App).'}
                 </p>
-                {activeTab === 'pending' && isWorking && (
+                {activeTab === 'pending' && isWorking && householdSectionEval.canShowNewOrders && (
                   <div className="mt-4 inline-flex items-center space-x-2 space-x-reverse px-3 py-1.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold">
                     <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
                     <span>التحديث اللحظي واستقبال الطلبات فعال</span>
@@ -3902,6 +4040,7 @@ export default function App() {
                   const canAccept =
                     order.status === 'pending_review' &&
                     Boolean(settings?.delivery_enabled) &&
+                    householdSectionEval.canAcceptNewOrders &&
                     currentDriver?.status === 'approved' &&
                     currentDriver?.is_active &&
                     isWorking;

@@ -12,17 +12,32 @@ import {
   enqueueOfflineAction,
 } from '../lib/offlineStore';
 import type { DeliveryDriver } from '../App';
-import type { CentralGeoContext } from '../types';
+import type { AppSectionSettingsState, CentralGeoContext } from '../types';
+import {
+  evaluateSectionOperationalStatus,
+  fetchAppSectionSettings,
+} from '../lib/sectionSettingsService';
+import { getSupabaseClient, isSupabaseConfigured } from '../services/supabaseClient';
 
 interface UsePharmacyOptions {
   currentDriver: DeliveryDriver | null;
   isWorking?: boolean;
   deliveryEnabled: boolean;
   geoContext?: CentralGeoContext | null;
+  sectionSettings?: AppSectionSettingsState | null;
+  onSectionSettingsRefreshed?: (next: AppSectionSettingsState) => void;
   onToast?: (text: string, type?: 'success' | 'error' | 'info') => void;
 }
 
-export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled, geoContext = null, onToast }: UsePharmacyOptions) {
+export function usePharmacy({
+  currentDriver,
+  isWorking = false,
+  deliveryEnabled,
+  geoContext = null,
+  sectionSettings = null,
+  onSectionSettingsRefreshed,
+  onToast,
+}: UsePharmacyOptions) {
   const [pharmacyOrders, setPharmacyOrders] = useState<PharmacyOrder[]>([]);
   const [selectedPharmacyOrder, setSelectedPharmacyOrder] = useState<PharmacyOrder | null>(null);
   const [isPharmacyLoading, setIsPharmacyLoading] = useState<boolean>(false);
@@ -52,6 +67,16 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
   useEffect(() => {
     geoContextRef.current = geoContext;
   }, [geoContext]);
+
+  const sectionSettingsRef = useRef<AppSectionSettingsState | null>(sectionSettings);
+  useEffect(() => {
+    sectionSettingsRef.current = sectionSettings;
+  }, [sectionSettings]);
+
+  const onSectionSettingsRefreshedRef = useRef(onSectionSettingsRefreshed);
+  useEffect(() => {
+    onSectionSettingsRefreshedRef.current = onSectionSettingsRefreshed;
+  }, [onSectionSettingsRefreshed]);
 
   // Concurrency lock to prevent duplicate clicks or parallel acceptance of pharmacy orders
   const acceptingPharmacyOrderIdsRef = useRef<Set<string>>(new Set());
@@ -140,9 +165,14 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
       if (navigator.onLine) {
         const data = await pharmacyService.getOrdersForDriver(driver, geoContextRef.current);
         setPharmacyOrders((prev) => {
-          // Detect if any new pending review order arrived in driver territory
+          // Detect if any new pending review order arrived in driver territory (only notify if pharmacy section is operational)
+          const pharmacyOperational = sectionSettingsRef.current
+            ? evaluateSectionOperationalStatus(sectionSettingsRef.current, 'pharmacy').canShowNewOrders
+            : true;
           const prevIds = new Set(prev.map((o) => o.id));
-          const newPendingOrders = data.filter((o) => !prevIds.has(o.id) && o.status === 'pending_review');
+          const newPendingOrders = pharmacyOperational
+            ? data.filter((o) => !prevIds.has(o.id) && o.status === 'pending_review' && !o.assigned_driver_id)
+            : [];
           if (newPendingOrders.length > 0) {
             notify('⚡ وصلت فاتورة صيدلية جديدة في نطاقك الجغرافي!', 'info');
             try {
@@ -411,6 +441,14 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
         return;
       }
 
+      if (sectionSettingsRef.current) {
+        const localSecEval = evaluateSectionOperationalStatus(sectionSettingsRef.current, 'pharmacy');
+        if (!localSecEval.canAcceptNewOrders) {
+          notify(localSecEval.reason, 'error');
+          return;
+        }
+      }
+
       if (acceptingPharmacyOrderIdsRef.current.has(order.id)) {
         return;
       }
@@ -418,6 +456,18 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
 
       setIsPharmacyActionLoading(true);
       try {
+        // Fresh live verification directly from app_section_settings before calling accept RPC
+        const sb = getSupabaseClient();
+        if (sb && isSupabaseConfigured()) {
+          const freshSectionSettings = await fetchAppSectionSettings(sb);
+          onSectionSettingsRefreshedRef.current?.(freshSectionSettings);
+          const freshEval = evaluateSectionOperationalStatus(freshSectionSettings, 'pharmacy');
+          if (!freshEval.canAcceptNewOrders) {
+            notify(freshEval.reason, 'error');
+            return;
+          }
+        }
+
         const updated = await pharmacyService.acceptOrder(order.id, currentDriver);
         syncUpdatedOrderInState(updated);
         notify('تم قبول فاتورة الصيدلية بنجاح! يمكنك الآن بدء تجهيز الأدوية.', 'success');
@@ -881,11 +931,16 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
     [syncUpdatedOrderInState]
   );
 
-  // Counts by tab matching central eligibility rules
+  // Counts by tab matching central eligibility rules & pharmacy section status
   const pharmacyCounts = useMemo(() => {
+    const pharmacySectionActive = sectionSettings
+      ? evaluateSectionOperationalStatus(sectionSettings, 'pharmacy').canShowNewOrders
+      : true;
+
     const canSeePending =
       Boolean(isWorking) &&
       Boolean(deliveryEnabled) &&
+      pharmacySectionActive &&
       currentDriver?.status === 'approved' &&
       Boolean(currentDriver?.is_active);
 
@@ -925,7 +980,7 @@ export function usePharmacy({ currentDriver, isWorking = false, deliveryEnabled,
       cancelled,
       total: pharmacyOrders.length,
     };
-  }, [pharmacyOrders, currentDriver, isWorking, deliveryEnabled, geoContext]);
+  }, [pharmacyOrders, currentDriver, isWorking, deliveryEnabled, geoContext, sectionSettings]);
 
   return {
     pharmacyOrders,

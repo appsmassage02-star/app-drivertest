@@ -6,7 +6,8 @@ import { PharmacyOrderCard } from './PharmacyOrderCard';
 import { PharmacyOrderDetailsModal } from './PharmacyOrderDetailsModal';
 import { PharmacyCancellationModal } from './PharmacyCancellationModal';
 import type { DeliveryDriver } from '../../App';
-import type { CentralGeoContext } from '../../types';
+import type { AppSectionSettingsState, CentralGeoContext } from '../../types';
+import { evaluateSectionOperationalStatus } from '../../lib/sectionSettingsService';
 
 interface PharmacyOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
@@ -15,6 +16,7 @@ interface PharmacyOrdersSectionProps {
   isWorking?: boolean;
   deliveryEnabled: boolean;
   geoContext?: CentralGeoContext | null;
+  sectionSettings?: AppSectionSettingsState | null;
   pharmacyOrders: PharmacyOrder[];
   selectedPharmacyOrder: PharmacyOrder | null;
   isPharmacyLoading: boolean;
@@ -77,6 +79,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   isWorking = true,
   deliveryEnabled,
   geoContext = null,
+  sectionSettings = null,
   pharmacyOrders,
   selectedPharmacyOrder,
   isPharmacyLoading,
@@ -104,6 +107,18 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
 }) => {
   const [cancellationTargetOrder, setCancellationTargetOrder] = useState<PharmacyOrder | null>(null);
 
+  const pharmacySectionEval = useMemo(
+    () =>
+      sectionSettings
+        ? evaluateSectionOperationalStatus(sectionSettings, 'pharmacy')
+        : null,
+    [sectionSettings]
+  );
+
+  const isPharmacySectionOperational = pharmacySectionEval
+    ? pharmacySectionEval.canShowNewOrders
+    : true;
+
   const filteredPharmacyOrders = useMemo(() => {
     let list = [...pharmacyOrders];
 
@@ -111,6 +126,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
       const canSeePending =
         Boolean(isWorking) &&
         Boolean(deliveryEnabled) &&
+        isPharmacySectionOperational &&
         currentDriver?.status === 'approved' &&
         Boolean(currentDriver?.is_active);
 
@@ -159,7 +175,16 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
     }
 
     return list;
-  }, [pharmacyOrders, activeTab, currentDriver, isWorking, deliveryEnabled, geoContext, searchQuery]);
+  }, [
+    pharmacyOrders,
+    activeTab,
+    currentDriver,
+    isWorking,
+    deliveryEnabled,
+    isPharmacySectionOperational,
+    geoContext,
+    searchQuery,
+  ]);
 
   if (!['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab)) {
     return null;
@@ -168,11 +193,29 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   const canAcceptBase =
     Boolean(isWorking) &&
     Boolean(deliveryEnabled) &&
+    isPharmacySectionOperational &&
     currentDriver?.status === 'approved' &&
     Boolean(currentDriver?.is_active);
 
   return (
     <div className="space-y-4">
+      {/* Pharmacy Section Stopped Notice (Only on pending tab; ongoing assigned orders are never blocked) */}
+      {activeTab === 'pending' && pharmacySectionEval && !pharmacySectionEval.canShowNewOrders && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 flex items-center space-x-3 space-x-reverse text-rose-950 shadow-2xs">
+          <div className="w-10 h-10 rounded-xl bg-rose-100 border border-rose-200 flex items-center justify-center shrink-0 text-rose-700">
+            <Pill className="w-5 h-5" />
+          </div>
+          <div className="text-xs leading-relaxed">
+            <strong className="block text-rose-950 font-extrabold text-sm mb-0.5">
+              استقبال طلبات الصيدلية الجديدة متوقف حاليًا
+            </strong>
+            <span>
+              {pharmacySectionEval.reason} (طلباتك المقبولة مسبقًا لا تتأثر وتستمر عبر تبويب «قيد التنفيذ»).
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Work Availability Notice for Pharmacy Orders */}
       {activeTab === 'pending' && !isWorking && (
         <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 flex items-center space-x-3 space-x-reverse text-amber-950 shadow-2xs">

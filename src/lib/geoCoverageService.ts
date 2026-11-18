@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
+  AppSectionSettingsState,
   CentralGeoContext,
   DbFailedOperation,
   DeliveryDriver,
@@ -11,6 +12,10 @@ import type {
   OrderFinancialBreakdown,
 } from '../types';
 import { isRestaurantOrder, isTalabatyDeliveryResponsibility } from './restaurantService';
+import {
+  evaluateSectionOperationalStatus,
+  resolveOrderSectionKey,
+} from './sectionSettingsService';
 
 export type OrderEligibilityReasonCode =
   | 'ASSIGNED_TO_DRIVER'
@@ -20,6 +25,9 @@ export type OrderEligibilityReasonCode =
   | 'DRIVER_INACTIVE'
   | 'DRIVER_NOT_WORKING'
   | 'DELIVERY_SERVICE_DISABLED'
+  | 'SECTION_DISABLED'
+  | 'SECTION_DELIVERY_DISABLED'
+  | 'SECTION_SETTINGS_UNAVAILABLE'
   | 'RESTAURANT_NOT_ELIGIBLE'
   | 'AFFILIATION_MISMATCH'
   | 'COVERAGE_NOT_LOADED'
@@ -627,6 +635,7 @@ export interface OrderEligibilityOptions {
   isWorking: boolean;
   deliveryEnabled: boolean;
   geoContext: CentralGeoContext | null;
+  sectionSettings?: AppSectionSettingsState | null;
 }
 
 /**
@@ -660,7 +669,7 @@ export function isOrderEligibleForDriver(
     };
   }
 
-  // Already assigned to current driver -> ALWAYS visible even if coverage changed or isWorking=false
+  // Already assigned to current driver -> ALWAYS visible even if section disabled, coverage changed, or isWorking=false
   if (assignedDriverId && assignedDriverId === String(driver.id)) {
     return {
       matched: true,
@@ -708,6 +717,24 @@ export function isOrderEligibleForDriver(
       reasonCode: 'ORDER_STATUS_NOT_ACCEPTABLE',
       reason: `حالة الطلب (${order?.status}) لا تسمح بظهوره كطلب جديد متاح للقبول.`,
     };
+  }
+
+  if (options.sectionSettings) {
+    const sectionKey = resolveOrderSectionKey(order);
+    const secEval = evaluateSectionOperationalStatus(options.sectionSettings, sectionKey);
+    if (!secEval.canShowNewOrders) {
+      const reasonCode: OrderEligibilityReasonCode =
+        secEval.statusCode === 'SECTION_DISABLED'
+          ? 'SECTION_DISABLED'
+          : secEval.statusCode === 'DELIVERY_DISABLED'
+          ? 'SECTION_DELIVERY_DISABLED'
+          : 'SECTION_SETTINGS_UNAVAILABLE';
+      return {
+        matched: false,
+        reasonCode,
+        reason: secEval.reason,
+      };
+    }
   }
 
   return evaluateCentralCoverageMatch(order, driver, options.geoContext);
