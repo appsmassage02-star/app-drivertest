@@ -111,12 +111,33 @@ export const DriverLocationSettingsCard: React.FC<
             <span className="text-slate-500 font-semibold">حالة التتبع المركزي:</span>
             <span className="font-bold text-slate-800">
               {isTrackingActive
-                ? 'نشط ومسجل بالخادم'
+                ? 'نشط ومسجل بالخادم (الواجهة فقط)'
                 : systemSettings.driver_tracking_enabled === false
                 ? 'متوقف من الإعدادات المركزية'
                 : systemSettings.load_state !== 'loaded'
                 ? 'تعذر التحقق من الإعدادات'
                 : 'قراءة محلية لحساب المسافات'}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
+            <span>الفاصل الزمني للتتبع:</span>
+            <span className="font-mono font-bold">
+              {systemSettings.driver_location_update_interval_seconds != null &&
+              systemSettings.driver_tracking_enabled === true
+                ? `كل ${systemSettings.driver_location_update_interval_seconds} ثانية`
+                : 'غير مفعل'}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
+            <span>الملاحة ومسافة الطريق:</span>
+            <span className={`font-bold ${systemSettings.navigation_enabled ? 'text-emerald-700' : 'text-slate-600'}`}>
+              {systemSettings.navigation_enabled === true
+                ? `مفعّلة (${systemSettings.routing_provider || 'google'})`
+                : systemSettings.navigation_enabled === false
+                ? 'متوقفة من الإدارة'
+                : 'غير محددة'}
             </span>
           </div>
 
@@ -178,32 +199,46 @@ export const DriverLocationSettingsCard: React.FC<
           </div>
           <span
             className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold border inline-flex items-center gap-1 ${
-              centralGeoContext.coverageRows.length > 0
+              centralGeoContext.coverageRows.filter((c) => c.is_active).length > 0
                 ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
                 : 'bg-amber-50 text-amber-800 border-amber-200'
             }`}
           >
             <ShieldCheck className="w-3.5 h-3.5" />
             <span>
-              {centralGeoContext.driverKind === 'restaurant_staff'
+              {centralGeoContext.driverAffiliation === 'restaurant_staff'
                 ? 'تغطية سائق مطعم'
                 : 'تغطية سائق منصة'}
               {' • '}
-              {centralGeoContext.coverageRows.length} نطاق نشط
+              {centralGeoContext.coverageRows.filter((c) => c.is_active).length} نطاق نشط
             </span>
           </span>
         </div>
 
         {centralGeoContext.coverageRows.length > 0 ? (
           <div className="flex flex-wrap gap-1.5">
-            {centralGeoContext.coverageRows.slice(0, 8).map((cov, idx) => (
-              <span
-                key={cov.id || idx}
-                className="text-[11px] font-semibold bg-white text-slate-700 border border-blue-200/70 px-2.5 py-1 rounded-lg"
-              >
-                {cov.area_name || cov.center_name || cov.governorate_name || 'نطاق معتمد'}
-              </span>
-            ))}
+            {centralGeoContext.coverageRows.slice(0, 8).map((cov, idx) => {
+              const areaLabel = cov.area_id
+                ? centralGeoContext.areas.find((a) => a.id === cov.area_id)?.name_ar ||
+                  centralGeoContext.areas.find((a) => a.id === cov.area_id)?.name
+                : null;
+              const centerLabel = cov.center_id
+                ? centralGeoContext.centers.find((c) => c.id === cov.center_id)?.name_ar ||
+                  centralGeoContext.centers.find((c) => c.id === cov.center_id)?.name
+                : null;
+              const govLabel = cov.governorate_id
+                ? centralGeoContext.governorates.find((g) => g.id === cov.governorate_id)?.name_ar ||
+                  centralGeoContext.governorates.find((g) => g.id === cov.governorate_id)?.name
+                : null;
+              return (
+                <span
+                  key={cov.id || idx}
+                  className="text-[11px] font-semibold bg-white text-slate-700 border border-blue-200/70 px-2.5 py-1 rounded-lg"
+                >
+                  {areaLabel || centerLabel || govLabel || 'نطاق معتمد'}
+                </span>
+              );
+            })}
             {centralGeoContext.coverageRows.length > 8 && (
               <span className="text-[11px] font-bold text-blue-700 px-2 py-1">
                 +{centralGeoContext.coverageRows.length - 8} مناطق أخرى

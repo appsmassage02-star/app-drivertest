@@ -338,6 +338,112 @@ export async function fetchDriverCentralCoverage(
   }
 }
 
+export function isUsableCentralGeoContext(
+  context?: CentralGeoContext | null
+): context is CentralGeoContext {
+  return Boolean(context && context.coverageLoadState && context.coverageLoadState !== 'idle');
+}
+
+/**
+ * Safely hydrates missing central geo IDs (and optional coordinates / embedded address)
+ * from `household_addresses` when orders reference `address_id` or `source_address_id`.
+ * Strictly reads IDs/coordinates only — NEVER invents geo IDs from text names.
+ */
+export async function hydrateOrdersGeoFromAddresses(
+  supabase: SupabaseClient | null,
+  rows: any[],
+  mode: 'regular' | 'pharmacy'
+): Promise<any[]> {
+  if (!supabase || !Array.isArray(rows) || rows.length === 0) return rows || [];
+
+  const addressIds = new Set<string>();
+  for (const row of rows) {
+    if (!row) continue;
+    const addrId = mode === 'pharmacy' ? row.source_address_id || row.address_id : row.address_id;
+    if (!addrId) continue;
+
+    const missingCentralIds =
+      mode === 'pharmacy'
+        ? !row.address_area_id && !row.address_center_id && !row.address_governorate_id
+        : !row.delivery_area_id && !row.delivery_center_id && !row.delivery_governorate_id;
+
+    const missingCoords =
+      mode === 'pharmacy'
+        ? row.address_latitude == null || row.address_longitude == null
+        : (row.delivery_latitude == null && row.address_longitude == null) ||
+          (row.address_latitude == null && row.address_longitude == null);
+
+    if (missingCentralIds || (missingCoords && !row.household_addresses)) {
+      addressIds.add(String(addrId));
+    }
+  }
+
+  if (addressIds.size === 0) return rows;
+
+  try {
+    const { data: addresses, error } = await supabase
+      .from('household_addresses')
+      .select('*')
+      .in('id', Array.from(addressIds));
+
+    if (error || !Array.isArray(addresses) || addresses.length === 0) {
+      return rows;
+    }
+
+    const byId = new Map<string, any>();
+    for (const addr of addresses) {
+      if (addr?.id) byId.set(String(addr.id), addr);
+    }
+
+    return rows.map((row) => {
+      if (!row) return row;
+      const addrId = mode === 'pharmacy' ? row.source_address_id || row.address_id : row.address_id;
+      const addr = addrId ? byId.get(String(addrId)) : null;
+      if (!addr) return row;
+
+      const resolvedAreaId =
+        addr.area_id ?? addr.delivery_area_id ?? addr.address_area_id ?? addr.geo_area_id ?? null;
+      const resolvedCenterId =
+        addr.center_id ?? addr.delivery_center_id ?? addr.address_center_id ?? addr.geo_center_id ?? null;
+      const resolvedGovId =
+        addr.governorate_id ??
+        addr.delivery_governorate_id ??
+        addr.address_governorate_id ??
+        addr.geo_governorate_id ??
+        null;
+
+      if (mode === 'pharmacy') {
+        return {
+          ...row,
+          household_addresses: row.household_addresses || addr,
+          address_area_id: row.address_area_id ?? resolvedAreaId,
+          address_center_id: row.address_center_id ?? resolvedCenterId,
+          address_governorate_id: row.address_governorate_id ?? resolvedGovId,
+          address_governorate_name: row.address_governorate_name || addr.governorate_name || null,
+          address_governorate_code: row.address_governorate_code || addr.governorate_code || null,
+          address_center_name: row.address_center_name || addr.markaz_name || null,
+          address_text: row.address_text || addr.detailed_address || null,
+          address_latitude: row.address_latitude ?? addr.latitude ?? null,
+          address_longitude: row.address_longitude ?? addr.longitude ?? null,
+        };
+      }
+
+      return {
+        ...row,
+        delivery_area_id: row.delivery_area_id ?? row.geo_area_id ?? resolvedAreaId,
+        delivery_center_id: row.delivery_center_id ?? row.geo_center_id ?? resolvedCenterId,
+        delivery_governorate_id: row.delivery_governorate_id ?? row.geo_governorate_id ?? resolvedGovId,
+        address_latitude: row.address_latitude ?? addr.latitude ?? null,
+        address_longitude: row.address_longitude ?? addr.longitude ?? null,
+        delivery_latitude: row.delivery_latitude ?? addr.latitude ?? null,
+        delivery_longitude: row.delivery_longitude ?? addr.longitude ?? null,
+      };
+    });
+  } catch {
+    return rows;
+  }
+}
+
 export async function loadFullCentralGeoContext(
   supabase: SupabaseClient | null,
   driver: DeliveryDriver | null
@@ -353,34 +459,108 @@ export async function loadFullCentralGeoContext(
   };
 }
 
-function getOrderServiceCategory(order: any): 'regular' | 'restaurant' | 'pharmacy' {
-  if (
-    order?.type === 'pharmacy' ||
-    order?.prescription_title ||
-    order?.address_governorate_name ||
-    order?.address_governorate_id ||
-    order?.address_center_id ||
-    order?.address_area_id
-  ) {
+export function getOrderServiceCategory(order: any): 'regular' | 'restaurant' | 'pharmacy' {
+  const explicitType = String(order?.type || '').toLowerCase().trim();
+  if (explicitType === 'pharmacy') {
     return 'pharmacy';
   }
+  if (explicitType === 'restaurant' || explicitType === 'ready_food') {
+    return 'restaurant';
+  }
+  if (explicitType === 'regular' || explicitType === 'household' || explicitType === 'household_shortages') {
+    return 'regular';
+  }
+
+  const hasPharmacyMarkers = Boolean(
+    order?.prescription_title ||
+      order?.saved_prescription_id ||
+      order?.requested_pharmacy_id ||
+      order?.pharmacy_selection_mode ||
+      order?.pharmacy_delivery_orders ||
+      order?.pharmacy_order_items ||
+      Array.isArray(order?.prescription_images) ||
+      Array.isArray(order?.driver_visited_pharmacies)
+  );
+  if (hasPharmacyMarkers) {
+    return 'pharmacy';
+  }
+
   if (isRestaurantOrder(order)) {
     return 'restaurant';
   }
+
+  const hasDeliveryGeoIds = Boolean(
+    order?.delivery_governorate_id || order?.delivery_center_id || order?.delivery_area_id
+  );
+  if (
+    !hasDeliveryGeoIds &&
+    Boolean(
+      order?.address_governorate_name ||
+        order?.address_governorate_id ||
+        order?.address_center_id ||
+        order?.address_area_id
+    )
+  ) {
+    return 'pharmacy';
+  }
+
   return 'regular';
 }
 
-function doesCoverageServiceMatch(
-  coverageServiceType: string | null | undefined,
+export function doesCoverageServiceMatch(
+  coverageServiceType: unknown,
   orderService: 'regular' | 'restaurant' | 'pharmacy'
 ): boolean {
-  if (!coverageServiceType) return true;
-  const s = coverageServiceType.toLowerCase().trim();
-  if (!s || s === 'all' || s === 'any') return true;
-  if (orderService === 'regular') {
-    return s === 'regular' || s === 'home' || s === 'delivery' || s === 'household';
+  if (coverageServiceType === null || coverageServiceType === undefined) return true;
+
+  const rawTokens = Array.isArray(coverageServiceType)
+    ? coverageServiceType.map((v) => String(v || ''))
+    : String(coverageServiceType).split(/[,;|/\s]+/);
+
+  const tokens = rawTokens.map((t) => t.toLowerCase().trim()).filter(Boolean);
+  if (tokens.length === 0) return true;
+
+  const regularAliases = new Set([
+    'regular',
+    'regular_orders',
+    'home',
+    'delivery',
+    'household',
+    'household_shortages',
+    'household_orders',
+    'shortages',
+  ]);
+  const pharmacyAliases = new Set([
+    'pharmacy',
+    'pharmacies',
+    'pharmacy_orders',
+    'medicines',
+    'prescriptions',
+  ]);
+  const restaurantAliases = new Set([
+    'restaurant',
+    'restaurants',
+    'restaurant_orders',
+    'ready_food',
+    'food',
+  ]);
+
+  for (const s of tokens) {
+    if (s === 'all' || s === 'any' || s === '*' || s === 'general') {
+      return true;
+    }
+    if (orderService === 'regular' && regularAliases.has(s)) {
+      return true;
+    }
+    if (orderService === 'pharmacy' && pharmacyAliases.has(s)) {
+      return true;
+    }
+    if (orderService === 'restaurant' && restaurantAliases.has(s)) {
+      return true;
+    }
   }
-  return s === orderService;
+
+  return false;
 }
 
 /**
@@ -481,15 +661,27 @@ export function evaluateCentralCoverageMatch(
   const rawAreaId =
     orderService === 'pharmacy'
       ? order?.address_area_id || null
-      : order?.delivery_area_id || order?.area_id || null;
+      : order?.delivery_area_id ||
+        order?.geo_area_id ||
+        order?.area_id ||
+        (order?.type === 'regular' ? order?.address_area_id : null) ||
+        null;
   const rawCenterId =
     orderService === 'pharmacy'
       ? order?.address_center_id || null
-      : order?.delivery_center_id || order?.center_id || null;
+      : order?.delivery_center_id ||
+        order?.geo_center_id ||
+        order?.center_id ||
+        (order?.type === 'regular' ? order?.address_center_id : null) ||
+        null;
   const rawGovId =
     orderService === 'pharmacy'
       ? order?.address_governorate_id || null
-      : order?.delivery_governorate_id || order?.governorate_id || null;
+      : order?.delivery_governorate_id ||
+        order?.geo_governorate_id ||
+        order?.governorate_id ||
+        (order?.type === 'regular' ? order?.address_governorate_id : null) ||
+        null;
 
   const areaEntity = rawAreaId
     ? context.areas.find((a) => a.id === String(rawAreaId)) || null

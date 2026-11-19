@@ -26,10 +26,30 @@ export interface UseDriverGPSResult {
   gpsErrorMessage: string | null;
   isLoadingGPS: boolean;
   isTrackingActive: boolean;
+  trackingIntervalSeconds: number | null;
+  trackingScope: 'foreground_only';
+  backgroundTrackingSupported: false;
   trackingAccuracyWarning: string | null;
   lastTrackingResult: TrackingPersistResult | null;
   requestGPSLocation: (highAccuracy?: boolean) => Promise<DriverGPSLocation | null>;
   navigateToCoordinates: (lat: number, lng: number, label?: string) => { success: boolean; error?: string };
+}
+
+/**
+ * Computes periodic GPS persistence interval strictly from central delivery_system_settings.
+ * Returns null (disabling periodic writes) when tracking is not enabled or interval is missing/invalid.
+ * NEVER falls back to a hardcoded default interval such as 45_000 ms.
+ */
+export function resolveTrackingIntervalMs(
+  settings?: DeliverySystemSettings | null
+): number | null {
+  if (!settings || settings.load_state !== 'loaded') return null;
+  if (settings.driver_tracking_enabled !== true) return null;
+  const seconds = settings.driver_location_update_interval_seconds;
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds <= 0) {
+    return null;
+  }
+  return Math.round(seconds * 1000);
 }
 
 export function useDriverGPS(
@@ -44,12 +64,18 @@ export function useDriverGPS(
   const [lastTrackingResult, setLastTrackingResult] = useState<TrackingPersistResult | null>(null);
 
   const isRequestingRef = useRef(false);
+  const intervalRef = useRef<any>(null);
   const trackingOptionsRef = useRef(trackingOptions);
   trackingOptionsRef.current = trackingOptions;
+
+  const trackingIntervalMs = resolveTrackingIntervalMs(trackingOptions?.systemSettings);
+  const trackingIntervalSeconds =
+    trackingIntervalMs !== null ? Math.round(trackingIntervalMs / 1000) : null;
 
   const isTrackingActive = Boolean(
     autoRequestWhenWorking &&
       trackingOptions?.systemSettings?.driver_tracking_enabled === true &&
+      trackingIntervalMs !== null &&
       trackingOptions?.driverId &&
       driverLocation &&
       lastTrackingResult?.status === 'saved'
@@ -87,7 +113,7 @@ export function useDriverGPS(
           setTrackingAccuracyWarning(validation.reason);
           setGpsErrorMessage(validation.reason);
           // Do not persist rejected readings!
-          if (opts?.supabase && opts?.driverId) {
+          if (opts?.supabase && opts?.driverId && settings.driver_tracking_enabled === true) {
             const rejectedRes = await recordDriverLocation(
               opts.supabase,
               opts.driverId,
@@ -108,7 +134,7 @@ export function useDriverGPS(
       setDriverLocation(loc);
 
       // Persist ONLY when tracking is explicitly enabled in delivery_system_settings and driverId is present
-      if (opts?.supabase && opts?.driverId && settings) {
+      if (opts?.supabase && opts?.driverId && settings?.driver_tracking_enabled === true) {
         const persistRes = await recordDriverLocation(
           opts.supabase,
           opts.driverId,
@@ -117,6 +143,17 @@ export function useDriverGPS(
           opts.activeOrderId
         );
         setLastTrackingResult(persistRes);
+      } else if (settings && settings.driver_tracking_enabled !== true) {
+        setLastTrackingResult({
+          status:
+            settings.load_state === 'loaded' ? 'skipped_disabled' : 'skipped_settings_unavailable',
+          message:
+            settings.load_state === 'loaded'
+              ? 'تتبع موقع السائقين معطل من إعدادات النظام (driver_tracking_enabled = false).'
+              : 'إعدادات تتبع السائقين غير متوفرة.',
+          currentLocationSaved: false,
+          historySaved: false,
+        });
       }
 
       return loc;
@@ -130,22 +167,36 @@ export function useDriverGPS(
     return openExternalNavigation(lat, lng, label);
   }, []);
 
-  // Request GPS when driver availability status switches to working, and refresh periodically while working if tracking enabled
+  // Request initial GPS when working; run periodic tracking interval ONLY at the central interval when enabled
   useEffect(() => {
-    if (!autoRequestWhenWorking) return;
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+
+    if (!autoRequestWhenWorking || !trackingOptions?.driverId) {
+      return;
+    }
+
     void requestGPSLocation(true);
 
-    const trackingEnabled = trackingOptions?.systemSettings?.driver_tracking_enabled === true;
-    if (!trackingEnabled) return;
+    if (trackingIntervalMs === null) {
+      return;
+    }
 
-    const timer = setInterval(() => {
+    intervalRef.current = setInterval(() => {
       void requestGPSLocation(true);
-    }, 45_000);
+    }, trackingIntervalMs);
 
-    return () => clearInterval(timer);
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
   }, [
     autoRequestWhenWorking,
-    trackingOptions?.systemSettings?.driver_tracking_enabled,
+    trackingIntervalMs,
     trackingOptions?.driverId,
     requestGPSLocation,
   ]);
@@ -156,6 +207,9 @@ export function useDriverGPS(
     gpsErrorMessage,
     isLoadingGPS,
     isTrackingActive,
+    trackingIntervalSeconds,
+    trackingScope: 'foreground_only',
+    backgroundTrackingSupported: false,
     trackingAccuracyWarning,
     lastTrackingResult,
     requestGPSLocation,

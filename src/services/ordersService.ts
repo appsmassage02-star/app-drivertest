@@ -14,8 +14,11 @@ import { getSupabaseClient, isSupabaseConfigured, subscribeToRealtimeChanges } f
 import {
   evaluateCentralCoverageMatch,
   extractOrderFinancialBreakdown,
+  hydrateOrdersGeoFromAddresses,
+  isUsableCentralGeoContext,
   loadFullCentralGeoContext,
 } from '../lib/geoCoverageService';
+import { isPharmacyOrderMatchingDriverTerritory } from '../lib/pharmacyService';
 import {
   createEmptyAppSectionSettingsState,
   evaluateSectionOperationalStatus,
@@ -69,19 +72,53 @@ function resolveStorageUrl(client: any, rawPathOrUrl: string, defaultBucket = 'p
   return trimmed;
 }
 
-class OrdersService {
+export const REALTIME_MONITORED_TABLES = [
+  'delivery_orders',
+  'delivery_order_items',
+  'pharmacy_orders',
+  'pharmacy_delivery_orders',
+  'pharmacy_order_items',
+  'delivery_drivers',
+  'app_section_settings',
+] as const;
+
+export type RealtimeAggregateStatus =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'SUBSCRIBED'
+  | 'CHANNEL_ERROR'
+  | 'TIMED_OUT'
+  | 'CLOSED';
+
+export type RealtimeSubscriberFn = (
+  table: string,
+  onPayload: (payload: any) => void,
+  onStatusChange?: (status: string, err?: any) => void,
+  filter?: string
+) => (() => void) | null;
+
+export class OrdersService {
   private regularOrders: DeliveryOrder[] = [];
   private pharmacyOrders: PharmacyOrder[] = [];
   private historyOrders: DeliveryOrder[] = [];
   private listeners: Array<() => void> = [];
+  private statusListeners: Array<(status: RealtimeAggregateStatus, err?: any) => void> = [];
+  private rawEventListeners: Array<
+    (table: string, eventType: string, recordId: string | null, rawPayload: any) => void
+  > = [];
 
   // Concurrency & Debounce guards
   private isFetching = false;
   private fetchQueued = false;
   private realtimeDebounceTimer: any = null;
+  private pendingTriggerKeys = new Set<string>();
 
   // Realtime & Subscriptions
   private realtimeUnsubscribes: Array<() => void> = [];
+  private channelStatuses = new Map<string, string>();
+  private realtimeStatus: RealtimeAggregateStatus = 'DISCONNECTED';
+  private realtimeError: string | null = null;
+  private realtimeSubscriber: RealtimeSubscriberFn = subscribeToRealtimeChanges;
   private pollingTimer: any = null;
   private lastSyncTime: Date = new Date();
   private lastSyncError: string | null = null;
@@ -95,7 +132,7 @@ class OrdersService {
   private onOnlineBound: () => void;
   private onVisibilityChangeBound: () => void;
 
-  constructor() {
+  constructor(autoInit = true) {
     this.onOnlineBound = () => {
       console.log('[OrdersService] Internet connection restored. Refreshing authoritative orders...');
       this.refreshOrders();
@@ -108,28 +145,114 @@ class OrdersService {
       }
     };
 
-    this.setupWindowListeners();
-    this.startAutoSync();
+    if (autoInit) {
+      this.setupWindowListeners();
+      this.startAutoSync();
+    }
+  }
+
+  // Allow unit tests to inject a mock Realtime subscriber without touching live Supabase
+  public setRealtimeSubscriber(fn: RealtimeSubscriberFn): void {
+    this.realtimeSubscriber = fn;
+  }
+
+  public getRealtimeStatus(): {
+    status: RealtimeAggregateStatus;
+    error: string | null;
+    channelStatuses: Record<string, string>;
+  } {
+    return {
+      status: this.realtimeStatus,
+      error: this.realtimeError,
+      channelStatuses: Object.fromEntries(this.channelStatuses.entries()),
+    };
+  }
+
+  public subscribeToStatus(
+    listener: (status: RealtimeAggregateStatus, err?: any) => void
+  ): () => void {
+    this.statusListeners.push(listener);
+    try {
+      listener(this.realtimeStatus, this.realtimeError);
+    } catch (err) {
+      console.error('[OrdersService] Error notifying status listener:', err);
+    }
+    return () => {
+      this.statusListeners = this.statusListeners.filter((l) => l !== listener);
+    };
+  }
+
+  public subscribeToRawEvents(
+    listener: (table: string, eventType: string, recordId: string | null, rawPayload: any) => void
+  ): () => void {
+    this.rawEventListeners.push(listener);
+    return () => {
+      this.rawEventListeners = this.rawEventListeners.filter((l) => l !== listener);
+    };
+  }
+
+  private notifyStatus(err?: any): void {
+    this.statusListeners.forEach((listener) => {
+      try {
+        listener(this.realtimeStatus, err ?? this.realtimeError ?? undefined);
+      } catch (e) {
+        console.error('[OrdersService] Error notifying status listener:', e);
+      }
+    });
+  }
+
+  private computeAggregateRealtimeStatus(): RealtimeAggregateStatus {
+    if (this.channelStatuses.size === 0) return 'DISCONNECTED';
+    const statuses = Array.from(this.channelStatuses.values());
+    if (statuses.some((s) => s === 'CHANNEL_ERROR')) return 'CHANNEL_ERROR';
+    if (statuses.some((s) => s === 'TIMED_OUT')) return 'TIMED_OUT';
+    if (statuses.some((s) => s === 'CLOSED')) return 'CLOSED';
+    if (
+      REALTIME_MONITORED_TABLES.every((tbl) => this.channelStatuses.get(tbl) === 'SUBSCRIBED')
+    ) {
+      return 'SUBSCRIBED';
+    }
+    return 'CONNECTING';
+  }
+
+  public reconnectRealtime(): void {
+    this.setupSupabaseRealtime();
   }
 
   // Bind or switch driver session and zone
   public setDriverSession(driverId: string | null, zone?: { governorate?: string; center?: string }): void {
     if (!driverId) {
       this.currentDriverId = null;
+      this.currentDriverRecord = null;
       this.currentDriverZone = {};
+      this.centralGeoContext = null;
       this.regularOrders = [];
       this.pharmacyOrders = [];
       this.historyOrders = [];
+      this.pendingTriggerKeys.clear();
       this.cleanupRealtime();
+      this.realtimeStatus = 'DISCONNECTED';
+      this.realtimeError = null;
+      this.notifyStatus();
       this.notify();
       return;
     }
 
-    const hasChanged = this.currentDriverId !== driverId ||
+    const hasChanged =
+      this.currentDriverId !== driverId ||
       this.currentDriverZone.governorate !== zone?.governorate ||
       this.currentDriverZone.center !== zone?.center;
 
     if (hasChanged) {
+      if (this.currentDriverId && this.currentDriverId !== driverId) {
+        // Switched driver account -> reset prior driver orders and geo state immediately
+        this.currentDriverRecord = null;
+        this.centralGeoContext = null;
+        this.regularOrders = [];
+        this.pharmacyOrders = [];
+        this.historyOrders = [];
+        this.pendingTriggerKeys.clear();
+      }
       this.currentDriverId = driverId;
       this.currentDriverZone = zone || {};
       console.log(`[OrdersService] Driver session set to: ${driverId} (Zone: ${zone?.governorate || '-'})`);
@@ -186,7 +309,7 @@ class OrdersService {
     }
   }
 
-  // Auto polling fallback for live updates
+  // Auto polling fallback for live updates (continues automatically when Realtime disconnects)
   public startAutoSync(intervalMs = 30000): void {
     if (this.pollingTimer) {
       clearInterval(this.pollingTimer);
@@ -219,82 +342,111 @@ class OrdersService {
     this.stopAutoSync();
     this.removeWindowListeners();
     this.currentDriverId = null;
+    this.currentDriverRecord = null;
     this.currentDriverZone = {};
+    this.centralGeoContext = null;
     this.isFetching = false;
     this.fetchQueued = false;
     this.regularOrders = [];
     this.pharmacyOrders = [];
     this.historyOrders = [];
+    this.pendingTriggerKeys.clear();
     this.lastSyncError = null;
+    this.realtimeStatus = 'DISCONNECTED';
+    this.realtimeError = null;
+    this.notifyStatus();
     this.notify();
   }
 
-  // Setup Supabase Realtime using actual tables:
+  // Setup Supabase Realtime across the 7 authoritative active tables (explicitly excluding restaurant_orders):
   // "delivery_orders", "delivery_order_items", "pharmacy_orders",
-  // "pharmacy_delivery_orders", "pharmacy_order_items", "delivery_drivers"
+  // "pharmacy_delivery_orders", "pharmacy_order_items", "delivery_drivers", "app_section_settings"
   private setupSupabaseRealtime(): void {
     this.cleanupRealtime();
-    if (!isSupabaseConfigured()) return;
+    const isUsingCustomSubscriber = this.realtimeSubscriber !== subscribeToRealtimeChanges;
+    if (!isUsingCustomSubscriber && !isSupabaseConfigured()) {
+      this.realtimeStatus = 'DISCONNECTED';
+      this.notifyStatus();
+      return;
+    }
+
+    const prevStatus = this.realtimeStatus;
+    this.realtimeStatus = 'CONNECTING';
+    this.realtimeError = null;
+    REALTIME_MONITORED_TABLES.forEach((tbl) => this.channelStatuses.set(tbl, 'CONNECTING'));
+    if (prevStatus !== 'CONNECTING') {
+      this.notifyStatus();
+    } else {
+      this.notifyStatus();
+    }
 
     const handleRealtimeTrigger = (tableName: string, payload: any) => {
-      console.log(`[Realtime Event] ${tableName} received:`, payload?.eventType);
+      const eventType = String(payload?.eventType || payload?.type || 'SYNC').toUpperCase();
+      const rawRecord = payload?.new || payload?.old || payload?.record || null;
+      const recordId = rawRecord?.id
+        ? String(rawRecord.id)
+        : rawRecord?.order_id
+        ? String(rawRecord.order_id)
+        : rawRecord?.pharmacy_order_id
+        ? String(rawRecord.pharmacy_order_id)
+        : null;
+
+      console.log(`[Realtime Event] ${tableName} received:`, eventType);
+
+      this.rawEventListeners.forEach((listener) => {
+        try {
+          listener(tableName, eventType, recordId, payload);
+        } catch (err) {
+          console.error('[OrdersService] Error notifying raw event listener:', err);
+        }
+      });
+
+      const dedupeKey = `${tableName}:${eventType}:${recordId || 'global'}`;
+      if (this.pendingTriggerKeys.has(dedupeKey) && this.realtimeDebounceTimer) {
+        return;
+      }
+      this.pendingTriggerKeys.add(dedupeKey);
       this.scheduleDebouncedFetch();
     };
 
-    const handleStatusChange = (status: string) => {
-      if (status === 'SUBSCRIBED') {
-        console.log('[Realtime] Channel connected/reconnected. Fetching latest authoritative orders...');
+    const handleTableStatusChange = (tableName: string, status: string, err?: any) => {
+      this.channelStatuses.set(tableName, status);
+      const nextAggStatus = this.computeAggregateRealtimeStatus();
+      const errMessage = err
+        ? typeof err === 'string'
+          ? err
+          : err?.message || err?.error_description || 'خطأ في قناة Realtime'
+        : null;
+
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        this.realtimeError = errMessage || `تعذر اتصال قناة ${tableName} (${status})`;
+      } else if (nextAggStatus === 'SUBSCRIBED') {
+        this.realtimeError = null;
+      }
+
+      const changed = this.realtimeStatus !== nextAggStatus || Boolean(errMessage);
+      this.realtimeStatus = nextAggStatus;
+
+      if (changed) {
+        this.notifyStatus(errMessage || undefined);
+      }
+
+      if (nextAggStatus === 'SUBSCRIBED' && status === 'SUBSCRIBED') {
+        console.log('[Realtime] All monitored channels subscribed. Fetching latest authoritative orders...');
         this.scheduleDebouncedFetch();
       }
     };
 
-    // 1. Regular delivery tables
-    const unsubDeliveryOrders = subscribeToRealtimeChanges(
-      'delivery_orders',
-      (payload) => handleRealtimeTrigger('delivery_orders', payload),
-      handleStatusChange
-    );
-    if (unsubDeliveryOrders) this.realtimeUnsubscribes.push(unsubDeliveryOrders);
-
-    const unsubDeliveryItems = subscribeToRealtimeChanges(
-      'delivery_order_items',
-      (payload) => handleRealtimeTrigger('delivery_order_items', payload)
-    );
-    if (unsubDeliveryItems) this.realtimeUnsubscribes.push(unsubDeliveryItems);
-
-    // 2. Pharmacy tables
-    const unsubPharmacyOrders = subscribeToRealtimeChanges(
-      'pharmacy_orders',
-      (payload) => handleRealtimeTrigger('pharmacy_orders', payload),
-      handleStatusChange
-    );
-    if (unsubPharmacyOrders) this.realtimeUnsubscribes.push(unsubPharmacyOrders);
-
-    const unsubPharmacyDelivery = subscribeToRealtimeChanges(
-      'pharmacy_delivery_orders',
-      (payload) => handleRealtimeTrigger('pharmacy_delivery_orders', payload)
-    );
-    if (unsubPharmacyDelivery) this.realtimeUnsubscribes.push(unsubPharmacyDelivery);
-
-    const unsubPharmacyItems = subscribeToRealtimeChanges(
-      'pharmacy_order_items',
-      (payload) => handleRealtimeTrigger('pharmacy_order_items', payload)
-    );
-    if (unsubPharmacyItems) this.realtimeUnsubscribes.push(unsubPharmacyItems);
-
-    // 3. Driver table for live driver profile / assignment updates
-    const unsubDrivers = subscribeToRealtimeChanges(
-      'delivery_drivers',
-      (payload) => handleRealtimeTrigger('delivery_drivers', payload)
-    );
-    if (unsubDrivers) this.realtimeUnsubscribes.push(unsubDrivers);
-
-    // 4. Central section & delivery operational settings
-    const unsubSectionSettings = subscribeToRealtimeChanges(
-      'app_section_settings',
-      (payload) => handleRealtimeTrigger('app_section_settings', payload)
-    );
-    if (unsubSectionSettings) this.realtimeUnsubscribes.push(unsubSectionSettings);
+    for (const tableName of REALTIME_MONITORED_TABLES) {
+      const unsub = this.realtimeSubscriber(
+        tableName,
+        (payload) => handleRealtimeTrigger(tableName, payload),
+        (status, err) => handleTableStatusChange(tableName, status, err)
+      );
+      if (unsub) {
+        this.realtimeUnsubscribes.push(unsub);
+      }
+    }
   }
 
   private cleanupRealtime(): void {
@@ -306,14 +458,16 @@ class OrdersService {
       }
     });
     this.realtimeUnsubscribes = [];
+    this.channelStatuses.clear();
   }
 
-  // Debounced fetch to absorb burst events without duplicate queries
+  // Debounced fetch to absorb burst events (e.g. multiple item rows) without duplicate queries
   private scheduleDebouncedFetch(delayMs = 350): void {
     if (this.realtimeDebounceTimer) {
       clearTimeout(this.realtimeDebounceTimer);
     }
     this.realtimeDebounceTimer = setTimeout(() => {
+      this.pendingTriggerKeys.clear();
       this.refreshOrders();
     }, delayMs);
   }
@@ -484,7 +638,9 @@ class OrdersService {
         }
       }
 
-      for (const row of rows) {
+      const hydratedRows = await hydrateOrdersGeoFromAddresses(client, rows, 'regular');
+
+      for (const row of hydratedRows) {
         const orderStatus = normalizeOrderStatus(row.status);
         // assigned_driver_id is the proven column in delivery_orders
         const assignedDriverId = row.assigned_driver_id
@@ -777,8 +933,15 @@ class OrdersService {
         // ignore
       }
 
+      const hydratedOrdersRows = await hydrateOrdersGeoFromAddresses(client, ordersRows, 'pharmacy');
+      const effectiveGeoContext = isUsableCentralGeoContext(geoContext)
+        ? geoContext
+        : driverRecord
+        ? await loadFullCentralGeoContext(client, driverRecord)
+        : geoContext ?? null;
+
       // 3. Process each pharmacy order
-      for (const row of ordersRows) {
+      for (const row of hydratedOrdersRows) {
         const rowIdStr = String(row.id);
         const orderStatus = normalizeOrderStatus(row.status);
 
@@ -805,8 +968,7 @@ class OrdersService {
           continue;
         }
 
-        // 2. If unassigned, verify pharmacy section is operational AND check geo IDs if explicitly present on pharmacy_orders;
-        // otherwise preserve existing pharmacy flow cleanly
+        // 2. If unassigned, verify pharmacy section is operational AND check territory via central geo / unified matcher
         if (!assignedDriverId) {
           if (orderStatus === 'delivered' || orderStatus === 'cancelled') {
             continue;
@@ -817,21 +979,20 @@ class OrdersService {
               continue;
             }
           }
-          const hasCentralIds = Boolean(
-            row.address_area_id || row.address_center_id || row.address_governorate_id
-          );
-          if (hasCentralIds && driverRecord) {
-            const matchRes = evaluateCentralCoverageMatch(row, driverRecord, geoContext);
-            if (!matchRes.matched) {
-              continue;
-            }
-          } else {
-            const rowGov = row.address_governorate_name || row.governorate;
-            const rowMarkaz = row.address_center_name || row.center;
-            if (governorate && rowGov && rowGov !== governorate) {
-              continue;
-            }
-            if (center && rowMarkaz && rowMarkaz !== center) {
+          if (driverRecord) {
+            const candidateOrder = {
+              id: rowIdStr,
+              type: 'pharmacy' as const,
+              status: String(row.status || '').trim().toLowerCase(),
+              assigned_driver_id: null,
+              governorate_name: row.address_governorate_name || row.governorate_name || row.governorate || '',
+              governorate_code: row.address_governorate_code || row.governorate_code || null,
+              markaz_name: row.address_center_name || row.markaz_name || row.center || '',
+              address_governorate_id: row.address_governorate_id ?? null,
+              address_center_id: row.address_center_id ?? null,
+              address_area_id: row.address_area_id ?? null,
+            } as any;
+            if (!isPharmacyOrderMatchingDriverTerritory(candidateOrder, driverRecord, effectiveGeoContext)) {
               continue;
             }
           }
@@ -946,6 +1107,8 @@ class OrdersService {
           createdAt: row.created_at
             ? new Date(row.created_at).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
             : 'الآن',
+          created_at: row.created_at,
+          updated_at: row.updated_at,
           estimatedDeliveryTime: '35 دقيقة',
           store: {
             id: String(row.requested_pharmacy_id || 'phr-1'),
@@ -984,7 +1147,7 @@ class OrdersService {
           driverFee,
           paymentMethod: 'cash',
           isPaid,
-          distanceKm: 4.2,
+          distanceKm: row.distance_km != null ? Number(row.distance_km) : 0,
           specialInstructions: row.customer_notes || undefined,
           prescriptionImages: prescriptionImages.length > 0 ? prescriptionImages : undefined,
           pharmacyNotes: row.customer_notes || undefined,
@@ -1593,7 +1756,7 @@ class OrdersService {
         driverFee: 16.0,
         paymentMethod: 'cash',
         isPaid: false,
-        distanceKm: 3.9,
+        distanceKm: 0,
       };
       this.regularOrders.unshift(newOrder);
     } else {
@@ -1603,6 +1766,7 @@ class OrdersService {
         type: 'pharmacy',
         status: 'new',
         createdAt: `الآن (${timestamp})`,
+        created_at: new Date().toISOString(),
         estimatedDeliveryTime: '30 دقيقة',
         needsPrescription: true,
         prescriptionVerified: true,
@@ -1638,7 +1802,7 @@ class OrdersService {
         driverFee: 18.0,
         paymentMethod: 'card',
         isPaid: true,
-        distanceKm: 4.2,
+        distanceKm: 0,
         pharmacyNotes: 'تم التجهيز والتأكد من توافق الجرعات للطفل.',
         prescriptionImages: [
           'https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?auto=format&fit=crop&w=700&q=80',

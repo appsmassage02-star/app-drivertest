@@ -78,68 +78,88 @@ function parsePositiveNum(val: any): number | null {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
+function parseTrimmedString(val: any): string | null {
+  if (val === null || val === undefined) return null;
+  const s = String(val).trim();
+  return s.length > 0 ? s : null;
+}
+
+function buildEmptySettings(
+  load_state: DeliverySystemSettings['load_state'],
+  error_message: string | null,
+  failedOperation: DbFailedOperation | null = null
+): DeliverySystemSettings {
+  return {
+    driver_tracking_enabled: null,
+    navigation_enabled: null,
+    routing_provider: null,
+    routing_engine: null,
+    driver_location_update_interval_seconds: null,
+    max_accepted_gps_accuracy_m: null,
+    route_deviation_threshold_m: null,
+    load_state,
+    error_message,
+    failedOperation,
+  };
+}
+
 /**
- * Fetches central tracking settings strictly from `delivery_system_settings`.
+ * Fetches central tracking & navigation settings strictly from `delivery_system_settings`.
  * Supports either single-row column layout or key-value row layout.
- * NEVER falls back to hardcoded accuracy thresholds or fake driver_tracking_enabled = true.
+ * NEVER falls back to hardcoded intervals, accuracy thresholds, or fake enabled booleans.
  */
 export async function fetchDeliverySystemSettings(
   supabase: SupabaseClient | null
 ): Promise<DeliverySystemSettings> {
   if (!supabase) {
-    return {
-      driver_tracking_enabled: null,
-      max_accepted_gps_accuracy_m: null,
-      load_state: 'error',
-      error_message: 'عميل Supabase غير مهيأ.',
-      failedOperation: {
-        table: 'delivery_system_settings',
-        operation: 'SELECT',
-        errorType: 'error',
-        isRls: false,
-        code: null,
-        message: 'عميل Supabase غير مهيأ.',
-      },
-    };
+    return buildEmptySettings('error', 'عميل Supabase غير مهيأ.', {
+      table: 'delivery_system_settings',
+      operation: 'SELECT',
+      errorType: 'error',
+      isRls: false,
+      code: null,
+      message: 'عميل Supabase غير مهيأ.',
+    });
   }
 
   try {
     const { data, error } = await supabase
       .from('delivery_system_settings')
       .select('*')
-      .limit(25);
+      .limit(50);
 
     if (error) {
       const failedOp = buildFailedOperation('delivery_system_settings', 'SELECT', error);
-      return {
-        driver_tracking_enabled: null,
-        max_accepted_gps_accuracy_m: null,
-        load_state: failedOp.errorType,
-        error_message: failedOp.message,
-        failedOperation: failedOp,
-      };
+      return buildEmptySettings(failedOp.errorType, failedOp.message, failedOp);
     }
 
     const rows = Array.isArray(data) ? data : [];
     if (rows.length === 0) {
-      return {
-        driver_tracking_enabled: null,
-        max_accepted_gps_accuracy_m: null,
-        load_state: 'empty',
-        error_message: 'جدول delivery_system_settings فارغ.',
-        failedOperation: null,
-      };
+      return buildEmptySettings('empty', 'جدول delivery_system_settings فارغ.', null);
     }
 
     // 1. Check direct column layout on first row
     const first = rows[0];
     if (
       first &&
-      ('driver_tracking_enabled' in first || 'max_accepted_gps_accuracy_m' in first)
+      ('driver_tracking_enabled' in first ||
+        'max_accepted_gps_accuracy_m' in first ||
+        'navigation_enabled' in first ||
+        'routing_provider' in first ||
+        'routing_engine' in first ||
+        'driver_location_update_interval_seconds' in first ||
+        'route_deviation_threshold_m' in first)
     ) {
       return {
         driver_tracking_enabled: parseBool(first.driver_tracking_enabled),
+        navigation_enabled: parseBool(first.navigation_enabled),
+        routing_provider: parseTrimmedString(first.routing_provider),
+        routing_engine: parseTrimmedString(first.routing_engine),
+        driver_location_update_interval_seconds: parsePositiveNum(
+          first.driver_location_update_interval_seconds
+        ),
         max_accepted_gps_accuracy_m: parsePositiveNum(first.max_accepted_gps_accuracy_m),
+        route_deviation_threshold_m: parsePositiveNum(first.route_deviation_threshold_m),
         load_state: 'loaded',
         raw_record: first,
         error_message: null,
@@ -149,20 +169,41 @@ export async function fetchDeliverySystemSettings(
 
     // 2. Key-value row fallback (e.g., key / setting_key + value / setting_value)
     let trackingEnabled: boolean | null = null;
+    let navigationEnabled: boolean | null = null;
+    let routingProvider: string | null = null;
+    let routingEngine: string | null = null;
+    let updateIntervalSeconds: number | null = null;
     let maxAccuracy: number | null = null;
+    let routeDeviationThresholdM: number | null = null;
+
     for (const r of rows) {
       const k = String(r.key || r.setting_key || r.name || '').toLowerCase().trim();
       const v = r.value ?? r.setting_value ?? r.setting_val;
       if (k === 'driver_tracking_enabled') {
         trackingEnabled = parseBool(v);
+      } else if (k === 'navigation_enabled') {
+        navigationEnabled = parseBool(v);
+      } else if (k === 'routing_provider') {
+        routingProvider = parseTrimmedString(v);
+      } else if (k === 'routing_engine') {
+        routingEngine = parseTrimmedString(v);
+      } else if (k === 'driver_location_update_interval_seconds') {
+        updateIntervalSeconds = parsePositiveNum(v);
       } else if (k === 'max_accepted_gps_accuracy_m') {
         maxAccuracy = parsePositiveNum(v);
+      } else if (k === 'route_deviation_threshold_m') {
+        routeDeviationThresholdM = parsePositiveNum(v);
       }
     }
 
     return {
       driver_tracking_enabled: trackingEnabled,
+      navigation_enabled: navigationEnabled,
+      routing_provider: routingProvider,
+      routing_engine: routingEngine,
+      driver_location_update_interval_seconds: updateIntervalSeconds,
       max_accepted_gps_accuracy_m: maxAccuracy,
+      route_deviation_threshold_m: routeDeviationThresholdM,
       load_state: 'loaded',
       raw_record: first,
       error_message: null,
@@ -170,13 +211,7 @@ export async function fetchDeliverySystemSettings(
     };
   } catch (err: any) {
     const failedOp = buildFailedOperation('delivery_system_settings', 'SELECT', err);
-    return {
-      driver_tracking_enabled: null,
-      max_accepted_gps_accuracy_m: null,
-      load_state: 'error',
-      error_message: failedOp.message,
-      failedOperation: failedOp,
-    };
+    return buildEmptySettings('error', failedOp.message, failedOp);
   }
 }
 

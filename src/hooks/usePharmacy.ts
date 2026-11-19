@@ -18,6 +18,7 @@ import {
   fetchAppSectionSettings,
 } from '../lib/sectionSettingsService';
 import { getSupabaseClient, isSupabaseConfigured } from '../services/supabaseClient';
+import { endNavigationSession } from '../lib/navigationService';
 
 interface UsePharmacyOptions {
   currentDriver: DeliveryDriver | null;
@@ -171,7 +172,12 @@ export function usePharmacy({
             : true;
           const prevIds = new Set(prev.map((o) => o.id));
           const newPendingOrders = pharmacyOperational
-            ? data.filter((o) => !prevIds.has(o.id) && o.status === 'pending_review' && !o.assigned_driver_id)
+            ? data.filter(
+                (o) =>
+                  !prevIds.has(o.id) &&
+                  String(o.status || '').trim().toLowerCase() === 'pending_review' &&
+                  !o.assigned_driver_id
+              )
             : [];
           if (newPendingOrders.length > 0) {
             notify('⚡ وصلت فاتورة صيدلية جديدة في نطاقك الجغرافي!', 'info');
@@ -413,6 +419,20 @@ export function usePharmacy({
       });
     };
   }, [realtimeSessionKey, currentDriver?.id, loadPharmacyOrders, notify, addDiagnosticLog]);
+
+  // Reload pharmacy orders automatically when central geo coverage becomes ready or changes
+  const lastGeoReloadSigRef = useRef<string>('');
+  const geoReloadSig =
+    currentDriver?.id && geoContext && geoContext.coverageLoadState !== 'idle'
+      ? `${currentDriver.id}:${geoContext.coverageLoadState}:${geoContext.geoLoadState}:${geoContext.coverageRows?.length ?? 0}`
+      : '';
+
+  useEffect(() => {
+    if (!geoReloadSig) return;
+    if (lastGeoReloadSigRef.current === geoReloadSig) return;
+    lastGeoReloadSigRef.current = geoReloadSig;
+    void loadPharmacyOrders('تحديث التغطية الجغرافية المركزية');
+  }, [geoReloadSig, loadPharmacyOrders]);
 
   // Phase 1: Online and visibility background order sync listeners removed pending Phase 2 replacement
 
@@ -838,6 +858,12 @@ export function usePharmacy({
           currentDriver.id,
           note
         );
+        void endNavigationSession({
+          supabase: getSupabaseClient(),
+          driverId: currentDriver.id,
+          orderId,
+          endStatus: 'cancelled',
+        });
         syncUpdatedOrderInState(updated);
         notify('تم تسجيل التواصل مع العميل وتحديث حالة الطلب لعدم توفر جميع الأصناف.', 'info');
       } catch (err: any) {
@@ -872,10 +898,22 @@ export function usePharmacy({
               };
             })
           );
+          void endNavigationSession({
+            supabase: getSupabaseClient(),
+            driverId: currentDriver.id,
+            orderId,
+            endStatus: 'completed',
+          });
           notify('تم تأكيد تسليم فاتورة الصيدلية محليًا (أوفلاين) وسيتم المزامنة فور عودة الاتصال.', 'info');
           return;
         }
         const updated = await pharmacyService.completeDelivery(orderId, currentDriver.id);
+        void endNavigationSession({
+          supabase: getSupabaseClient(),
+          driverId: currentDriver.id,
+          orderId,
+          endStatus: 'completed',
+        });
         syncUpdatedOrderInState(updated);
         notify('تم إتمام توصيل فاتورة الصيدلية للعميل بنجاح (completed).', 'success');
       } catch (err: any) {
@@ -899,6 +937,12 @@ export function usePharmacy({
           reasonCategory,
           reasonText
         );
+        void endNavigationSession({
+          supabase: getSupabaseClient(),
+          driverId: currentDriver.id,
+          orderId,
+          endStatus: 'cancelled',
+        });
         syncUpdatedOrderInState(updated);
         notify('تم إرسال طلب الإلغاء للمراجعة الإدارية بنجاح.', 'info');
         return true;
@@ -947,7 +991,7 @@ export function usePharmacy({
     const pending = canSeePending
       ? pharmacyOrders.filter(
           (o) =>
-            o.status === 'pending_review' &&
+            String(o.status || '').trim().toLowerCase() === 'pending_review' &&
             !o.assigned_driver_id &&
             isPharmacyOrderMatchingDriverTerritory(o, currentDriver, geoContext)
         ).length

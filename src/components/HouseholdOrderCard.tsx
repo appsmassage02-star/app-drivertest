@@ -13,16 +13,18 @@ import {
   Clock,
   AlertTriangle,
 } from 'lucide-react';
-import type { DeliveryDriver } from '../types';
+import type { DeliveryDriver, RouteDistanceResult } from '../types';
 import type { DriverGPSLocation } from '../lib/gpsService';
 import { extractOrderFinancialBreakdown } from '../lib/geoCoverageService';
-import { computeOrderDistanceFromDriver } from '../lib/orderDisplayHelpers';
 import { DeliveryOrder, formatSafeTime, formatSafeDateTime } from '../App';
 
 interface HouseholdOrderCardProps {
   order: DeliveryOrder;
   currentDriver?: DeliveryDriver | null;
   driverLocation?: DriverGPSLocation | null;
+  routeDistance?: RouteDistanceResult | null;
+  sequenceNumber?: number;
+  navigationEnabled?: boolean;
   canAccept: boolean;
   isWorking: boolean;
   isActionLoading: boolean;
@@ -79,7 +81,9 @@ function getHouseholdStatusBadge(status: DeliveryOrder['status']) {
 export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
   order,
   currentDriver,
-  driverLocation,
+  routeDistance,
+  sequenceNumber,
+  navigationEnabled = true,
   canAccept,
   isWorking,
   isActionLoading,
@@ -103,11 +107,17 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
     (order.status === 'accepted' || order.status === 'shopping') &&
     isAssignedToCurrent;
 
-  const distanceInfo = computeOrderDistanceFromDriver(
-    order,
-    'regular',
-    driverLocation
-  );
+  const hasRoadDistance = routeDistance?.status === 'road_distance';
+  const distanceLabel = hasRoadDistance
+    ? `${routeDistance.formattedDistance}${
+        routeDistance.formattedDuration ? ` • ${routeDistance.formattedDuration}` : ''
+      }`
+    : routeDistance?.status === 'loading'
+    ? 'جاري حساب الطريق...'
+    : routeDistance?.status === 'disabled' || !navigationEnabled
+    ? 'الملاحة متوقفة'
+    : 'مسافة الطريق غير متاحة';
+
   const fin = extractOrderFinancialBreakdown(order);
 
   const items = order.items || [];
@@ -121,6 +131,11 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
       {/* Calm Blue Accent Header Strip */}
       <div className="px-4 py-3 bg-blue-50/60 border-b border-blue-100 flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2 flex-wrap">
+          {typeof sequenceNumber === 'number' && (
+            <span className="font-mono text-[11px] font-extrabold px-2 py-0.5 rounded-lg bg-slate-800 text-white">
+              #{sequenceNumber}
+            </span>
+          )}
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-600 text-white text-[11px] font-bold">
             <Package className="w-3.5 h-3.5" />
             <span>نواقص المنزل</span>
@@ -166,14 +181,17 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
 
             <div
               className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border tabular-nums ${
-                distanceInfo.available
+                hasRoadDistance
                   ? 'bg-blue-50 text-blue-800 border-blue-200'
                   : 'bg-slate-100 text-slate-500 border-slate-200'
               }`}
-              title="المسافة من موقعك الحالي إلى عنوان العميل"
+              title={
+                routeDistance?.errorReason ||
+                'مسافة الطريق الفعلي من موقعك الحالي إلى عنوان العميل'
+              }
             >
               <Navigation className="w-3.5 h-3.5 shrink-0" />
-              <span>{distanceInfo.formatted}</span>
+              <span>{distanceLabel}</span>
             </div>
           </div>
 

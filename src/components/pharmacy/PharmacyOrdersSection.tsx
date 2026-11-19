@@ -6,7 +6,7 @@ import { PharmacyOrderCard } from './PharmacyOrderCard';
 import { PharmacyOrderDetailsModal } from './PharmacyOrderDetailsModal';
 import { PharmacyCancellationModal } from './PharmacyCancellationModal';
 import type { DeliveryDriver } from '../../App';
-import type { AppSectionSettingsState, CentralGeoContext } from '../../types';
+import type { AppSectionSettingsState, CentralGeoContext, RouteDistanceResult } from '../../types';
 import type { DriverGPSLocation } from '../../lib/gpsService';
 import { evaluateSectionOperationalStatus } from '../../lib/sectionSettingsService';
 import { sortOrdersOldestFirst } from '../../lib/orderDisplayHelpers';
@@ -16,6 +16,8 @@ interface PharmacyOrdersSectionProps {
   searchQuery: string;
   currentDriver: DeliveryDriver | null;
   driverLocation?: DriverGPSLocation | null;
+  routeDistances?: Record<string, RouteDistanceResult>;
+  navigationEnabled?: boolean;
   hideCardsList?: boolean;
   isWorking?: boolean;
   deliveryEnabled: boolean;
@@ -83,6 +85,8 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   searchQuery,
   currentDriver,
   driverLocation = null,
+  routeDistances = {},
+  navigationEnabled = true,
   hideCardsList = false,
   isWorking = true,
   deliveryEnabled,
@@ -316,12 +320,15 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {filteredPharmacyOrders.map((order) => (
+              {filteredPharmacyOrders.map((order, idx) => (
                 <PharmacyOrderCard
                   key={order.id}
                   order={order}
                   currentDriverId={currentDriver?.id}
                   driverLocation={driverLocation}
+                  routeDistance={routeDistances[`pharmacy:${order.id}`]}
+                  sequenceNumber={idx + 1}
+                  navigationEnabled={navigationEnabled}
                   canAccept={canAcceptBase && order.status === 'pending_review'}
                   isWorking={isWorking}
                   isActionLoading={isPharmacyActionLoading}

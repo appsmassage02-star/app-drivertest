@@ -351,11 +351,68 @@ export interface CentralGeoContext {
 
 export interface DeliverySystemSettings {
   driver_tracking_enabled: boolean | null;
+  navigation_enabled?: boolean | null;
+  routing_provider?: string | null;
+  routing_engine?: string | null;
+  driver_location_update_interval_seconds?: number | null;
   max_accepted_gps_accuracy_m: number | null;
+  route_deviation_threshold_m?: number | null;
   load_state: 'idle' | 'loaded' | 'empty' | 'permission_denied' | 'table_missing' | 'error';
   raw_record?: Record<string, any> | null;
   error_message?: string | null;
   failedOperation?: DbFailedOperation | null;
+}
+
+export type RouteDistanceStatus =
+  | 'road_distance'
+  | 'unavailable'
+  | 'disabled'
+  | 'loading';
+
+export interface RouteDistanceResult {
+  orderId: string;
+  orderType: OrderType;
+  status: RouteDistanceStatus;
+  isRoadDistance: boolean;
+  distanceMeters: number | null;
+  distanceKm: number | null;
+  durationSeconds: number | null;
+  formattedDistance: string;
+  formattedDuration: string | null;
+  provider: string | null;
+  engine: string | null;
+  calculatedAt: string | null;
+  originLat?: number | null;
+  originLng?: number | null;
+  destinationLat?: number | null;
+  destinationLng?: number | null;
+  errorReason?: string | null;
+}
+
+export type NavigationSessionStatus =
+  | 'active'
+  | 'recalculated'
+  | 'completed'
+  | 'cancelled'
+  | 'stopped';
+
+export interface NavigationSessionRecord {
+  id?: string | null;
+  driver_id: string;
+  order_id: string;
+  order_type: OrderType;
+  status: NavigationSessionStatus;
+  provider?: string | null;
+  engine?: string | null;
+  origin_latitude?: number | null;
+  origin_longitude?: number | null;
+  destination_latitude?: number | null;
+  destination_longitude?: number | null;
+  route_distance_m?: number | null;
+  route_duration_s?: number | null;
+  started_at?: string;
+  updated_at?: string;
+  ended_at?: string | null;
 }
 
 export type AppSectionKey = 'household_shortages' | 'pharmacy' | 'ready_food';

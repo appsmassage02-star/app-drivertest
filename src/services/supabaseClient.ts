@@ -151,7 +151,7 @@ export async function testSupabaseConnection(): Promise<{
 export function subscribeToRealtimeChanges(
   table: string,
   onPayload: (payload: any) => void,
-  onStatusChange?: (status: string) => void,
+  onStatusChange?: (status: string, err?: any) => void,
   filter?: string
 ): (() => void) | null {
   const client = getSupabaseClient();
@@ -180,7 +180,7 @@ export function subscribeToRealtimeChanges(
           console.warn(`[Realtime] Channel error on ${table}:`, err);
         }
         if (onStatusChange) {
-          onStatusChange(status);
+          onStatusChange(status, err);
         }
       });
 

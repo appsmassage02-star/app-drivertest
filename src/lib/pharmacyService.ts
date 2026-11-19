@@ -20,7 +20,10 @@ import { dataUrlToBlob } from '../components/DocumentUploader';
 import { ordersService } from '../services/ordersService';
 import type { CentralGeoContext, GeoArea } from '../types';
 import {
+  doesCoverageServiceMatch,
   evaluateCentralCoverageMatch,
+  hydrateOrdersGeoFromAddresses,
+  isUsableCentralGeoContext,
   loadFullCentralGeoContext,
   resolveDriverAffiliation,
 } from './geoCoverageService';
@@ -237,6 +240,12 @@ export function parseStructuredCustomerNotes(rawNotes?: string | null): {
  *   strictly uses central geo coverage matching.
  * - Otherwise preserves legacy pharmacy matching cleanly (and checks active central coverage center names if loaded).
  */
+function normalizeArabicCenterForMatch(value?: string | null): string {
+  return normalizeArabicLocation(value)
+    .replace(/^(?:مركز|مدينه|حي|قسم)\s+/g, '')
+    .trim();
+}
+
 export function isPharmacyOrderMatchingDriverTerritory(
   order: PharmacyOrder,
   driver: DeliveryDriver | null,
@@ -258,13 +267,22 @@ export function isPharmacyOrderMatchingDriverTerritory(
     return evaluateCentralCoverageMatch(order, driver, geoContext).matched;
   }
 
+  // If central coverage is explicitly empty, fail closed rather than leaking via stale profile text
+  if (geoContext && geoContext.coverageLoadState === 'empty') {
+    return false;
+  }
+
   // If central coverage is loaded without geo IDs on pharmacy_orders, check resolved center/gov names first
   if (geoContext && geoContext.coverageLoadState === 'loaded') {
-    const activeCov = geoContext.coverageRows.filter((c) => c.is_active);
+    const activeCov = geoContext.coverageRows.filter(
+      (c) => c.is_active && doesCoverageServiceMatch(c.service_type, 'pharmacy')
+    );
     if (activeCov.length === 0) return false;
 
-    const orderGovNorm = normalizeArabicLocation(order.governorate_name);
-    const orderMarkazNorm = normalizeArabicLocation(order.markaz_name);
+    const orderGovNorm = normalizeArabicLocation(order.governorate_name || (order as any).address_governorate_name);
+    const orderMarkazNorm = normalizeArabicLocation(order.markaz_name || (order as any).address_center_name);
+    const orderMarkazCore = normalizeArabicCenterForMatch(order.markaz_name || (order as any).address_center_name);
+
     if (orderGovNorm && orderMarkazNorm) {
       for (const cov of activeCov) {
         const covCenter = cov.center_id
@@ -280,11 +298,19 @@ export function isPharmacyOrderMatchingDriverTerritory(
           ? geoContext.governorates.find((g) => g.id === covCenter.governorate_id)
           : null;
 
-        if (covCenter && normalizeArabicLocation(covCenter.name) === orderMarkazNorm) {
-          if (!covGov || normalizeArabicLocation(covGov.name) === orderGovNorm) {
+        const covGovNorm = covGov ? normalizeArabicLocation(covGov.name_ar || covGov.name) : '';
+        const govOk = !covGov || !covGovNorm || covGovNorm === orderGovNorm;
+
+        if (covCenter) {
+          const covCenterNorm = normalizeArabicLocation(covCenter.name_ar || covCenter.name);
+          const covCenterCore = normalizeArabicCenterForMatch(covCenter.name_ar || covCenter.name);
+          const centerOk =
+            covCenterNorm === orderMarkazNorm ||
+            (Boolean(covCenterCore) && Boolean(orderMarkazCore) && covCenterCore === orderMarkazCore);
+          if (centerOk && govOk) {
             return true;
           }
-        } else if (!cov.center_id && !cov.area_id && covGov && normalizeArabicLocation(covGov.name) === orderGovNorm) {
+        } else if (!cov.center_id && !cov.area_id && covGov && covGovNorm === orderGovNorm) {
           return true;
         }
       }
@@ -298,9 +324,9 @@ export function isPharmacyOrderMatchingDriverTerritory(
   const driverMarkaz = (driver.markaz_name || '').trim();
   if (!driverGov || !driverMarkaz) return false;
 
-  const orderGov = (order.governorate_name || '').trim();
-  const orderGovCode = (order.governorate_code || '').trim();
-  const orderMarkaz = (order.markaz_name || '').trim();
+  const orderGov = (order.governorate_name || (order as any).address_governorate_name || '').trim();
+  const orderGovCode = (order.governorate_code || (order as any).address_governorate_code || '').trim();
+  const orderMarkaz = (order.markaz_name || (order as any).address_center_name || '').trim();
   if ((!orderGov && !orderGovCode) || !orderMarkaz) return false;
 
   const normDriverGov = normalizeArabicLocation(driverGov);
@@ -318,7 +344,11 @@ export function isPharmacyOrderMatchingDriverTerritory(
 
   const normDriverMarkaz = normalizeArabicLocation(driverMarkaz);
   const normOrderMarkaz = normalizeArabicLocation(orderMarkaz);
-  return normDriverMarkaz === normOrderMarkaz;
+  if (normDriverMarkaz === normOrderMarkaz) return true;
+
+  const coreDriverMarkaz = normalizeArabicCenterForMatch(driverMarkaz);
+  const coreOrderMarkaz = normalizeArabicCenterForMatch(orderMarkaz);
+  return Boolean(coreDriverMarkaz && coreOrderMarkaz && coreDriverMarkaz === coreOrderMarkaz);
 }
 
 /**
@@ -1050,15 +1080,18 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
       // ignore
     }
 
-    const effectiveGeoContext =
-      geoContextOverride || (driver ? await loadFullCentralGeoContext(supabase, driver) : null);
+    const hydratedOrdersRows = await hydrateOrdersGeoFromAddresses(supabase, ordersRows, 'pharmacy');
+
+    const effectiveGeoContext = isUsableCentralGeoContext(geoContextOverride)
+      ? geoContextOverride
+      : driver
+      ? await loadFullCentralGeoContext(supabase, driver)
+      : null;
 
     const driverId = driver?.id ? String(driver.id) : null;
-    const governorate = (driver?.governorate_name || (driver as any)?.governorate || '').trim();
-    const center = (driver?.markaz_name || (driver as any)?.center || '').trim();
 
     const resultList: PharmacyOrder[] = [];
-    for (const row of ordersRows) {
+    for (const row of hydratedOrdersRows) {
       const deliveryOrder = Array.isArray(row.pharmacy_delivery_orders)
         ? row.pharmacy_delivery_orders[0]
         : row.pharmacy_delivery_orders;
@@ -1074,30 +1107,31 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
         continue;
       }
 
-      // 2. If unassigned, check central geo IDs if explicitly present on pharmacy_orders;
-      // otherwise preserve existing pharmacy behavior cleanly
+      // 2. If unassigned, verify non-terminal status & territory match via unified central/legacy rules
+      const rowStatus = String(row.status || '').trim().toLowerCase();
       if (!assignedDriverId) {
-        if (row.status === 'completed' || row.status === 'cancelled' || row.status === 'delivered') {
+        if (
+          rowStatus === 'completed' ||
+          rowStatus === 'cancelled' ||
+          rowStatus === 'delivered' ||
+          rowStatus === 'unable_to_fulfill'
+        ) {
           continue;
         }
-        if (driver && resolveDriverAffiliation(driver) === 'restaurant_staff') {
-          continue;
-        }
-        const hasCentralOrderIds = Boolean(
-          row.address_area_id || row.address_center_id || row.address_governorate_id
-        );
-        if (hasCentralOrderIds && driver) {
-          const matchRes = evaluateCentralCoverageMatch(row, driver, effectiveGeoContext);
-          if (!matchRes.matched) {
-            continue;
-          }
-        } else {
-          const rowGov = (row.address_governorate_name || row.governorate_name || row.governorate || '').trim();
-          const rowMarkaz = (row.address_center_name || row.markaz_name || row.center || '').trim();
-          if (governorate && rowGov && rowGov !== governorate) {
-            continue;
-          }
-          if (center && rowMarkaz && rowMarkaz !== center) {
+        if (driver) {
+          const candidateOrder = {
+            id: String(row.id),
+            type: 'pharmacy' as const,
+            status: rowStatus,
+            assigned_driver_id: null,
+            governorate_name: row.address_governorate_name || row.governorate_name || row.governorate || '',
+            governorate_code: row.address_governorate_code || row.governorate_code || null,
+            markaz_name: row.address_center_name || row.markaz_name || row.center || '',
+            address_governorate_id: row.address_governorate_id ?? null,
+            address_center_id: row.address_center_id ?? null,
+            address_area_id: row.address_area_id ?? null,
+          } as any;
+          if (!isPharmacyOrderMatchingDriverTerritory(candidateOrder, driver, effectiveGeoContext)) {
             continue;
           }
         }
@@ -1984,26 +2018,61 @@ class SupabasePharmacyRepository implements IPharmacyRepository {
     onStatusChange?: (status: string, err?: any) => void,
     onRawEvent?: (table: string, eventType: string, recordId: string | null, rawPayload: any) => void
   ): () => void {
-    if (onStatusChange) {
-      onStatusChange('SUBSCRIBED');
-    }
+    const pharmacyTables = new Set([
+      'pharmacy_orders',
+      'pharmacy_delivery_orders',
+      'pharmacy_order_items',
+      'app_section_settings',
+    ]);
 
-    const unsub = ordersService.subscribe(() => {
+    const unsubStatus = onStatusChange
+      ? ordersService.subscribeToStatus((status, err) => {
+          onStatusChange(status, err);
+        })
+      : () => {};
+
+    const unsubRaw = ordersService.subscribeToRawEvents(
+      (table, eventType, recordId, rawPayload) => {
+        if (!pharmacyTables.has(table)) return;
+        if (onRawEvent) {
+          onRawEvent(table, eventType, recordId, rawPayload);
+        }
+        if (listener) {
+          const mappedType =
+            eventType === 'DELETE' && table === 'pharmacy_orders'
+              ? 'ORDER_DELETED'
+              : eventType === 'INSERT' && table === 'pharmacy_orders'
+              ? 'ORDER_INSERTED'
+              : table === 'pharmacy_order_items'
+              ? 'ITEMS_UPDATED'
+              : 'ORDER_DATA_UPDATED';
+          listener({
+            type: mappedType,
+            orderId: recordId || '',
+            table,
+            rawPayload,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+    );
+
+    const unsubSync = ordersService.subscribe(() => {
       if (listener) {
         listener({
-          type: 'ORDER_DATA_UPDATED',
+          type: 'SYNC_REQUESTED',
           orderId: '',
           table: 'pharmacy_orders',
-          record: null,
           timestamp: new Date().toISOString(),
-        } as any);
-      }
-      if (onRawEvent) {
-        onRawEvent('pharmacy_orders', 'SYNC', null, {});
+        });
       }
     });
 
-    return unsub;
+    return () => {
+      unsubStatus();
+      unsubRaw();
+      unsubSync();
+    };
   }
 }
 

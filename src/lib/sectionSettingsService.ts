@@ -343,18 +343,43 @@ export async function fetchAppSectionSettings(
 export function resolveOrderSectionKey(order: any): AppSectionKey {
   if (!order) return 'household_shortages';
 
-  if (
-    order.type === 'pharmacy' ||
-    order.prescription_title !== undefined ||
-    order.requested_pharmacy_id !== undefined ||
-    order.pharmacy_selection_mode !== undefined ||
-    order.address_governorate_id !== undefined
-  ) {
+  const explicitType = String(order.type || '').toLowerCase().trim();
+  if (explicitType === 'regular' || explicitType === 'household' || explicitType === 'household_shortages') {
+    return 'household_shortages';
+  }
+  if (explicitType === 'pharmacy') {
+    return 'pharmacy';
+  }
+  if (explicitType === 'restaurant' || explicitType === 'ready_food') {
+    return 'ready_food';
+  }
+
+  const hasTruthyPharmacyMarker = Boolean(
+    order.prescription_title ||
+      order.saved_prescription_id ||
+      order.requested_pharmacy_id ||
+      order.pharmacy_selection_mode ||
+      order.pharmacy_delivery_orders ||
+      order.pharmacy_order_items ||
+      Array.isArray(order.prescription_images) ||
+      Array.isArray(order.driver_visited_pharmacies)
+  );
+  if (hasTruthyPharmacyMarker) {
     return 'pharmacy';
   }
 
   if (isRestaurantOrder(order)) {
     return 'ready_food';
+  }
+
+  const hasDeliveryGeoIds = Boolean(
+    order.delivery_governorate_id || order.delivery_center_id || order.delivery_area_id
+  );
+  if (
+    !hasDeliveryGeoIds &&
+    Boolean(order.address_governorate_id || order.address_center_id || order.address_area_id)
+  ) {
+    return 'pharmacy';
   }
 
   return 'household_shortages';

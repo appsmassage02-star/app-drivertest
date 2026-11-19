@@ -14,19 +14,21 @@ import {
   Clock,
   User,
 } from 'lucide-react';
-import { DeliveryOrder } from '../../types';
+import { DeliveryOrder, RouteDistanceResult } from '../../types';
 import type { DriverGPSLocation } from '../../lib/gpsService';
 import {
   getRestaurantStatusBadge,
   computeRestaurantFinancials,
 } from '../../lib/restaurantService';
-import { computeOrderDistanceFromDriver } from '../../lib/orderDisplayHelpers';
 import { formatSafeTime, formatSafeDateTime } from '../../App';
 
 interface RestaurantOrderCardProps {
   order: DeliveryOrder;
   currentDriverId?: string | null;
   driverLocation?: DriverGPSLocation | null;
+  routeDistance?: RouteDistanceResult | null;
+  sequenceNumber?: number;
+  navigationEnabled?: boolean;
   canAccept: boolean;
   isWorking?: boolean;
   isActionLoading: boolean;
@@ -42,7 +44,9 @@ interface RestaurantOrderCardProps {
 export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
   order,
   currentDriverId,
-  driverLocation,
+  routeDistance,
+  sequenceNumber,
+  navigationEnabled = true,
   canAccept,
   isWorking = true,
   isActionLoading,
@@ -100,12 +104,17 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
     order.governorate_name ||
     null;
 
-  // Distance strictly from driver GPS location to restaurant coordinates
-  const distanceInfo = computeOrderDistanceFromDriver(
-    order,
-    'restaurant',
-    driverLocation
-  );
+  // Road distance strictly from driver GPS location to restaurant coordinates
+  const hasRoadDistance = routeDistance?.status === 'road_distance';
+  const distanceLabel = hasRoadDistance
+    ? `${routeDistance.formattedDistance}${
+        routeDistance.formattedDuration ? ` • ${routeDistance.formattedDuration}` : ''
+      }`
+    : routeDistance?.status === 'loading'
+    ? 'جاري حساب الطريق...'
+    : routeDistance?.status === 'disabled' || !navigationEnabled
+    ? 'الملاحة متوقفة'
+    : 'مسافة الطريق غير متاحة';
 
   const {
     totalAmount,
@@ -126,6 +135,11 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
       {/* Calm Orange Accent Header Strip */}
       <div className="px-4 py-3 bg-orange-50/70 border-b border-orange-100 flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2 flex-wrap">
+          {typeof sequenceNumber === 'number' && (
+            <span className="font-mono text-[11px] font-extrabold px-2 py-0.5 rounded-lg bg-slate-800 text-white">
+              #{sequenceNumber}
+            </span>
+          )}
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-orange-500 text-white text-[11px] font-bold">
             <UtensilsCrossed className="w-3.5 h-3.5" />
             <span>المطاعم</span>
@@ -173,14 +187,17 @@ export const RestaurantOrderCard: React.FC<RestaurantOrderCardProps> = ({
 
             <div
               className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border tabular-nums ${
-                distanceInfo.available
+                hasRoadDistance
                   ? 'bg-orange-100/80 text-orange-900 border-orange-200'
                   : 'bg-slate-100 text-slate-500 border-slate-200'
               }`}
-              title="المسافة من موقعك الحالي إلى المطعم"
+              title={
+                routeDistance?.errorReason ||
+                'مسافة الطريق الفعلي من موقعك الحالي إلى المطعم'
+              }
             >
               <Navigation className="w-3.5 h-3.5 shrink-0" />
-              <span>{distanceInfo.formatted}</span>
+              <span>{distanceLabel}</span>
             </div>
           </div>
 

@@ -1,6 +1,6 @@
 import React from 'react';
 import { UtensilsCrossed, RefreshCw } from 'lucide-react';
-import { AppSectionSettingsState, DeliveryOrder } from '../../types';
+import { AppSectionSettingsState, DeliveryOrder, RouteDistanceResult } from '../../types';
 import { RestaurantOrderCard } from './RestaurantOrderCard';
 import { RestaurantOrderDetailsModal } from './RestaurantOrderDetailsModal';
 import type { DeliveryDriver } from '../../App';
@@ -13,6 +13,8 @@ interface RestaurantOrdersSectionProps {
   searchQuery: string;
   currentDriver: DeliveryDriver | null;
   driverLocation?: DriverGPSLocation | null;
+  routeDistances?: Record<string, RouteDistanceResult>;
+  navigationEnabled?: boolean;
   hideCardsList?: boolean;
   isWorking?: boolean;
   deliveryEnabled: boolean;
@@ -42,6 +44,8 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
   activeTab,
   currentDriver,
   driverLocation = null,
+  routeDistances = {},
+  navigationEnabled = true,
   hideCardsList = false,
   isWorking = true,
   deliveryEnabled,
@@ -167,12 +171,15 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {sortedRestaurantOrders.map((order) => (
+              {sortedRestaurantOrders.map((order, idx) => (
                 <RestaurantOrderCard
                   key={order.id}
                   order={order}
                   currentDriverId={currentDriver?.id}
                   driverLocation={driverLocation}
+                  routeDistance={routeDistances[`restaurant:${order.id}`]}
+                  sequenceNumber={idx + 1}
+                  navigationEnabled={navigationEnabled}
                   canAccept={canAcceptBase && order.status === 'pending_review'}
                   isWorking={isWorking}
                   isActionLoading={isActionLoading}

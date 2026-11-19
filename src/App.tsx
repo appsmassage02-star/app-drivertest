@@ -77,6 +77,7 @@ import {
   loadFullCentralGeoContext,
   fetchCentralGeoHierarchy,
   evaluateCentralCoverageMatch,
+  hydrateOrdersGeoFromAddresses,
   isOrderEligibleForDriver,
   extractOrderFinancialBreakdown,
 } from './lib/geoCoverageService';
@@ -91,6 +92,12 @@ import { SectionStatusPanel } from './components/SectionStatusPanel';
 import { usePharmacy } from './hooks/usePharmacy';
 import { useDriverAuth } from './hooks/useDriverAuth';
 import { useDriverGPS } from './hooks/useDriverGPS';
+import { useOrderRouteDistances, getOrderRouteKey } from './hooks/useOrderRouteDistances';
+import {
+  clearNavigationSessionCache,
+  endNavigationSession,
+  sharedRouteDistanceManager,
+} from './lib/navigationService';
 import type {
   AppSectionSettingsState,
   CentralGeoContext,
@@ -395,7 +402,12 @@ export default function App() {
 
   const [systemSettings, setSystemSettings] = useState<DeliverySystemSettings>({
     driver_tracking_enabled: null,
+    navigation_enabled: null,
+    routing_provider: null,
+    routing_engine: null,
+    driver_location_update_interval_seconds: null,
     max_accepted_gps_accuracy_m: null,
+    route_deviation_threshold_m: null,
     load_state: 'idle',
   });
 
@@ -590,6 +602,16 @@ export default function App() {
     onToast: showToast,
   });
 
+  // Server-side Road Distance Manager for all visible/active orders across categories
+  const { routeDistances, recalculateOrderRoute } = useOrderRouteDistances({
+    supabase: getClient(),
+    driverId: currentDriver?.id || null,
+    driverLocation,
+    systemSettings,
+    orders,
+    pharmacyOrders,
+  });
+
   // Lightbox Document Viewer Modal State
   const [viewingDocModal, setViewingDocModal] = useState<{
     isOpen: boolean;
@@ -766,9 +788,11 @@ export default function App() {
           if (a.id && label) areaNameById.set(String(a.id), label);
         });
 
+        const hydratedRows = await hydrateOrdersGeoFromAddresses(supabase, rows, 'regular');
+
         // Deduplicate orders by id to avoid duplicate cards during Realtime bursts
         const orderMap = new Map<string, DeliveryOrder>();
-        for (const row of rows) {
+        for (const row of hydratedRows) {
           const assignedDriverId = row.assigned_driver_id
             ? String(row.assigned_driver_id)
             : (row.driver_id ? String(row.driver_id) : null);
@@ -783,10 +807,12 @@ export default function App() {
             continue;
           }
 
+          const rowStatus = String(row.status || 'pending_review').trim().toLowerCase() || 'pending_review';
+
           // 2. If unassigned -> evaluate STRICTLY via central geographic coverage IDs
           // Never reject assigned orders of the current driver even if coverage changed later
           if (!assignedDriverId) {
-            if (row.status === 'completed' || row.status === 'delivered' || row.status === 'cancelled') {
+            if (rowStatus === 'completed' || rowStatus === 'delivered' || rowStatus === 'cancelled') {
               continue;
             }
             const centralMatch = evaluateCentralCoverageMatch(row, activeDriver, loadedGeoContext);
@@ -809,6 +835,8 @@ export default function App() {
 
           const normalizedOrder: DeliveryOrder = {
             ...(row as any),
+            status: rowStatus as any,
+            raw_status: row.status,
             items: rawItems,
             assigned_driver_id: assignedDriverId,
             type: isRestaurantOrder(row) ? 'restaurant' : 'regular',
@@ -897,7 +925,12 @@ export default function App() {
       setCentralGeoContext(emptyCtx);
       setSystemSettings({
         driver_tracking_enabled: null,
+        navigation_enabled: null,
+        routing_provider: null,
+        routing_engine: null,
+        driver_location_update_interval_seconds: null,
         max_accepted_gps_accuracy_m: null,
+        route_deviation_threshold_m: null,
         load_state: 'idle',
       });
       if (supabaseUser?.id) {
@@ -922,17 +955,24 @@ export default function App() {
       if (isMounted) setHeaderImageSrc(newHeaderSrc);
     });
 
-    // Authoritative Realtime & Auto-Sync (from reference talabat-al-bayt-driver)
-    setIsRealtimeConnected(true);
-    setDeliveryRealtimeStatus('SUBSCRIBED');
+    // Honest Realtime channel status tracking from OrdersService (all 7 active tables)
+    const unsubStatus = ordersService.subscribeToStatus((status, err) => {
+      if (!isMounted) return;
+      const mappedStatus = (status as RealtimeConnectionStatus) || 'DISCONNECTED';
+      setDeliveryRealtimeStatus(mappedStatus);
+      setIsRealtimeConnected(status === 'SUBSCRIBED');
+      if (err) {
+        setDeliveryRealtimeError(typeof err === 'string' ? err : err?.message || 'خطأ في قناة البث اللحظي');
+      } else if (status === 'SUBSCRIBED') {
+        setDeliveryRealtimeError(null);
+      }
+    });
 
     const unsubOrders = ordersService.subscribe(() => {
       if (!isMounted) return;
       if (authStatus === 'approved_active') {
         void syncWithSupabase();
       }
-      setIsRealtimeConnected(true);
-      setDeliveryRealtimeStatus('SUBSCRIBED');
       setDeliveryLastEventTime(
         new Date().toLocaleTimeString('ar-EG', {
           hour12: false,
@@ -978,17 +1018,20 @@ export default function App() {
       isMounted = false;
       supabase.removeChannel(assetsChannel);
       supabase.removeChannel(sectionSettingsChannel);
+      unsubStatus();
       unsubOrders();
     };
   }, [authStatus, syncWithSupabase, refreshSectionSettings]);
 
-  // Sync driver session with ordersService
+  // Sync driver session with ordersService (clears cleanly when driver signs out)
   useEffect(() => {
     if (currentDriver?.id) {
       ordersService.setDriverSession(currentDriver.id, {
         governorate: currentDriver.governorate_name || (currentDriver as any).governorate,
         center: currentDriver.markaz_name || (currentDriver as any).center,
       });
+    } else {
+      ordersService.setDriverSession(null);
     }
   }, [currentDriver]);
 
@@ -1244,6 +1287,8 @@ export default function App() {
       setHeartbeatConsecutiveFailures(0);
       updateDriverAvailabilityFields(true, nowIso);
       showToast('تم بدء العمل بنجاح! أنت الآن متاح لاستقبال وتوصيل الطلبات.', 'success');
+      void syncWithSupabase();
+      void loadPharmacyOrders('بدء العمل');
     } catch (err: any) {
       showToast(`حدث خطأ أثناء محاولة بدء العمل: ${err?.message || err}`, 'error');
     } finally {
@@ -1632,6 +1677,13 @@ export default function App() {
 
     successfullyUploadedDocsRef.current.clear();
     acceptingOrderIdsRef.current.clear();
+    await endNavigationSession({
+      supabase: getClient(),
+      driverId: currentDriverRef.current?.id || null,
+      endStatus: 'stopped',
+    });
+    clearNavigationSessionCache();
+    sharedRouteDistanceManager.clear();
     await driverLogout();
     ordersService.cleanup();
     setOrders([]);
@@ -1643,7 +1695,12 @@ export default function App() {
     setCentralGeoContext(emptyCtx);
     setSystemSettings({
       driver_tracking_enabled: null,
+      navigation_enabled: null,
+      routing_provider: null,
+      routing_engine: null,
+      driver_location_update_interval_seconds: null,
       max_accepted_gps_accuracy_m: null,
+      route_deviation_threshold_m: null,
       load_state: 'idle',
     });
     const idleSections = createEmptyAppSectionSettingsState('idle');
@@ -2243,6 +2300,12 @@ export default function App() {
       };
 
       setOrderHistory((prev) => [newHist, ...prev]);
+      void endNavigationSession({
+        supabase,
+        driverId: currentDriver.id,
+        orderId: order.id,
+        endStatus: 'completed',
+      });
       showToast('تم إتمام التوصيل وتأكيد التسليم بنجاح.', 'success');
       await refreshOrderData(order.id);
     } catch (err: any) {
@@ -2337,6 +2400,12 @@ export default function App() {
     };
 
     setOrderHistory((prev) => [newHist, ...prev]);
+    void endNavigationSession({
+      supabase,
+      driverId: currentDriver.id,
+      orderId: cancelModalOrder.id,
+      endStatus: 'cancelled',
+    });
     setCancelModalOrder(null);
     setCancelReasonText('');
     showToast('تم إرسال طلب الإلغاء بنجاح وهو الآن في انتظار قرار الإدارة (cancellation_pending).', 'info');
@@ -4111,13 +4180,20 @@ export default function App() {
                   {activeTab === 'pending'
                     ? !isWorking
                       ? 'اضغط على «بدء العمل» في البطاقة العلوية لتفعيل استقبال وقبول الطلبات المتاحة في نطاقك الجغرافي.'
+                      : centralGeoContext.coverageLoadState === 'empty'
+                      ? 'لا توجد مناطق تغطية مركزية نشطة مسجلة لحسابك حاليًا، لذا لن تظهر طلبات جديدة حتى يتم تفعيل نطاق تغطية لك.'
+                      : centralGeoContext.coverageLoadState === 'permission_denied' ||
+                        centralGeoContext.coverageLoadState === 'error' ||
+                        centralGeoContext.coverageLoadState === 'table_missing'
+                      ? centralGeoContext.coverageError ||
+                        'تعذر تحميل بيانات التغطية الجغرافية المركزية حاليًا.'
                       : 'أنت متاح الآن وفي انتظار الطلبات الجديدة. بمجرد وصول طلب في نطاقك سيظهر هنا مرتبًا من الأقدم للأحدث.'
                     : 'لا توجد طلبات مطابقة في هذا القسم حاليًا.'}
                 </p>
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {unifiedChronologicalOrders.map((item) => {
+                {unifiedChronologicalOrders.map((item, idx) => {
                   if (item.kind === 'pharmacy') {
                     const pOrder = item.order as any;
                     const canAcceptPharmacy =
@@ -4133,6 +4209,9 @@ export default function App() {
                         order={pOrder}
                         currentDriverId={currentDriver?.id}
                         driverLocation={driverLocation}
+                        routeDistance={routeDistances[getOrderRouteKey('pharmacy', pOrder.id)]}
+                        sequenceNumber={idx + 1}
+                        navigationEnabled={systemSettings.navigation_enabled === true}
                         canAccept={canAcceptPharmacy}
                         isWorking={isWorking}
                         isActionLoading={isPharmacyActionLoading}
@@ -4166,6 +4245,9 @@ export default function App() {
                         order={rOrder}
                         currentDriverId={currentDriver?.id}
                         driverLocation={driverLocation}
+                        routeDistance={routeDistances[getOrderRouteKey('restaurant', rOrder.id)]}
+                        sequenceNumber={idx + 1}
+                        navigationEnabled={systemSettings.navigation_enabled === true}
                         canAccept={canAcceptRest}
                         isWorking={isWorking}
                         isActionLoading={isActionLoading}
@@ -4196,6 +4278,9 @@ export default function App() {
                       order={hOrder}
                       currentDriver={currentDriver}
                       driverLocation={driverLocation}
+                      routeDistance={routeDistances[getOrderRouteKey('regular', hOrder.id)]}
+                      sequenceNumber={idx + 1}
+                      navigationEnabled={systemSettings.navigation_enabled === true}
                       canAccept={canAcceptHome}
                       isWorking={isWorking}
                       isActionLoading={isActionLoading}
@@ -4229,6 +4314,8 @@ export default function App() {
               searchQuery={searchQuery}
               currentDriver={currentDriver}
               driverLocation={driverLocation}
+              routeDistances={routeDistances}
+              navigationEnabled={systemSettings.navigation_enabled === true}
               hideCardsList={orderCategoryView === 'all'}
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
@@ -4273,6 +4360,8 @@ export default function App() {
               searchQuery={searchQuery}
               currentDriver={currentDriver}
               driverLocation={driverLocation}
+              routeDistances={routeDistances}
+              navigationEnabled={systemSettings.navigation_enabled === true}
               hideCardsList={orderCategoryView === 'all'}
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
@@ -4356,7 +4445,7 @@ export default function App() {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {filteredHomeOrders.map((order) => {
+                {filteredHomeOrders.map((order, idx) => {
                   const canAccept =
                     order.status === 'pending_review' &&
                     Boolean(settings?.delivery_enabled) &&
@@ -4370,6 +4459,9 @@ export default function App() {
                       order={order}
                       currentDriver={currentDriver}
                       driverLocation={driverLocation}
+                      routeDistance={routeDistances[getOrderRouteKey('regular', order.id)]}
+                      sequenceNumber={idx + 1}
+                      navigationEnabled={systemSettings.navigation_enabled === true}
                       canAccept={canAccept}
                       isWorking={isWorking}
                       isActionLoading={isActionLoading}
@@ -5936,6 +6028,14 @@ export default function App() {
         isTrackingActive={isTrackingActive}
         lastTrackingResult={lastTrackingResult}
         onRefreshGPS={() => requestGPSLocation(false)}
+        supabase={getClient()}
+        driverId={currentDriver?.id || null}
+        routeDistance={
+          mapModalTarget?.order?.id
+            ? routeDistances[getOrderRouteKey(mapModalTarget.orderType, mapModalTarget.order.id)]
+            : null
+        }
+        onRecalculateRoute={recalculateOrderRoute}
       />
     </div>
   );

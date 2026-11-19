@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   MapPin,
   Navigation,
@@ -9,21 +10,25 @@ import {
   ExternalLink,
   RefreshCw,
   LocateFixed,
-  Store,
-  Home,
   UtensilsCrossed,
   Pill,
-  ShieldAlert,
+  Home,
+  Route,
+  Square,
 } from 'lucide-react';
 import {
   DriverGPSLocation,
   GPSStatus,
   extractOrderCoordinates,
   isValidCoordinate,
-  openExternalNavigation,
 } from '../../lib/gpsService';
-
-import type { DeliverySystemSettings } from '../../types';
+import {
+  endNavigationSession,
+  evaluateNavigationSettings,
+  getCachedActiveNavigationSession,
+  startOrderNavigation,
+} from '../../lib/navigationService';
+import type { DeliverySystemSettings, RouteDistanceResult } from '../../types';
 import type { TrackingPersistResult } from '../../lib/driverTrackingService';
 
 interface OrderMapModalProps {
@@ -39,6 +44,13 @@ interface OrderMapModalProps {
   isTrackingActive?: boolean;
   lastTrackingResult?: TrackingPersistResult | null;
   onRefreshGPS: () => Promise<DriverGPSLocation | null>;
+  supabase?: SupabaseClient | null;
+  driverId?: string | null;
+  routeDistance?: RouteDistanceResult | null;
+  onRecalculateRoute?: (
+    order: any,
+    orderType: 'restaurant' | 'pharmacy' | 'regular'
+  ) => Promise<RouteDistanceResult | null>;
 }
 
 export const OrderMapModal: React.FC<OrderMapModalProps> = ({
@@ -54,8 +66,15 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
   isTrackingActive = false,
   lastTrackingResult,
   onRefreshGPS,
+  supabase = null,
+  driverId = null,
+  routeDistance = null,
+  onRecalculateRoute,
 }) => {
   const [navigationNotice, setNavigationNotice] = useState<string | null>(null);
+  const [isRecalculatingRoute, setIsRecalculatingRoute] = useState(false);
+  const [isUpdatingSession, setIsUpdatingSession] = useState(false);
+  const [, setSessionRefreshTick] = useState(0);
 
   useEffect(() => {
     setNavigationNotice(null);
@@ -103,32 +122,72 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
     order.address_text ||
     'عنوان التوصيل المسجل';
 
-  // Check Google Maps API Key in environment
-  const googleMapsApiKey =
-    (typeof import.meta !== 'undefined' &&
-      (import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY) ||
-    '';
+  const navEval = evaluateNavigationSettings(systemSettings);
+  const activeSession = getCachedActiveNavigationSession(driverId, String(order.id));
 
-  const hasMapsApiKey = Boolean(
-    googleMapsApiKey &&
-      googleMapsApiKey.trim() !== '' &&
-      !googleMapsApiKey.includes('placeholder')
-  );
-
-  const handleStartNavigation = (
+  const handleStartNavigation = async (
     coords: { latitude: number; longitude: number } | null,
     destinationLabel: string
   ) => {
+    if (!navEval.allowed) {
+      setNavigationNotice(navEval.reason);
+      return;
+    }
+
     if (!coords || !isValidCoordinate(coords.latitude, coords.longitude)) {
       setNavigationNotice(`الإحداثيات الجغرافية لـ ${destinationLabel} غير متوفرة في بيانات هذا الطلب.`);
       return;
     }
 
-    const res = openExternalNavigation(coords.latitude, coords.longitude, destinationLabel);
-    if (!res.success) {
-      setNavigationNotice(res.error || 'تعذر بدء الملاحة.');
-    } else {
-      setNavigationNotice(null);
+    setIsUpdatingSession(true);
+    try {
+      const res = await startOrderNavigation({
+        supabase,
+        driverId,
+        orderId: String(order.id),
+        orderType,
+        destinationLat: coords.latitude,
+        destinationLng: coords.longitude,
+        destinationLabel,
+        driverLocation,
+        routeDistance,
+        systemSettings,
+      });
+
+      if (!res.success) {
+        setNavigationNotice(res.error || 'تعذر بدء الملاحة.');
+      } else {
+        setNavigationNotice(null);
+        setSessionRefreshTick((t) => t + 1);
+      }
+    } finally {
+      setIsUpdatingSession(false);
+    }
+  };
+
+  const handleStopNavigationSession = async () => {
+    if (!driverId) return;
+    setIsUpdatingSession(true);
+    try {
+      await endNavigationSession({
+        supabase,
+        driverId,
+        orderId: String(order.id),
+        endStatus: 'stopped',
+      });
+      setSessionRefreshTick((t) => t + 1);
+    } finally {
+      setIsUpdatingSession(false);
+    }
+  };
+
+  const handleRefreshRouteDistance = async () => {
+    if (!onRecalculateRoute) return;
+    setIsRecalculatingRoute(true);
+    try {
+      await onRecalculateRoute(order, orderType);
+    } finally {
+      setIsRecalculatingRoute(false);
     }
   };
 
@@ -152,7 +211,7 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
                 </span>
               </div>
               <p className="text-xs text-neutral-300 mt-0.5">
-                موقع السائق الحالي ونقاط الاستلام والتسليم الموثوقة
+                مسافة الطريق الفعلي، موقع السائق، وجلسات الملاحة المعتمدة
               </p>
             </div>
           </div>
@@ -170,17 +229,83 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
         {/* Modal Content */}
         <div className="p-4 sm:p-6 space-y-4 overflow-y-auto">
           {navigationNotice && (
-            <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl text-xs text-amber-950 flex items-center justify-between">
+            <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl text-xs text-amber-950 flex items-center justify-between gap-2">
               <span>{navigationNotice}</span>
               <button
                 type="button"
                 onClick={() => setNavigationNotice(null)}
-                className="text-amber-700 hover:text-amber-900 font-bold"
+                className="text-amber-700 hover:text-amber-900 font-bold shrink-0"
               >
                 ✕
               </button>
             </div>
           )}
+
+          {/* 0. Server-Side Road Distance & Active Navigation Session */}
+          <div className="bg-blue-50/70 border border-blue-200 rounded-2xl p-4 space-y-2.5">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <Route className="w-4 h-4 text-blue-700" />
+                <h4 className="font-extrabold text-sm text-blue-950">
+                  مسافة الطريق الفعلي ({orderType === 'restaurant' ? 'إلى المطعم' : 'إلى العميل'})
+                </h4>
+              </div>
+
+              {onRecalculateRoute && (
+                <button
+                  type="button"
+                  disabled={isRecalculatingRoute || !navEval.allowed}
+                  onClick={handleRefreshRouteDistance}
+                  className="px-3 py-1.5 bg-white hover:bg-blue-100 disabled:opacity-50 text-blue-800 border border-blue-300 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRecalculatingRoute ? 'animate-spin' : ''}`} />
+                  <span>إعادة حساب الطريق</span>
+                </button>
+              )}
+            </div>
+
+            <div className="bg-white/95 p-3 rounded-xl border border-blue-200/80 flex flex-wrap items-center justify-between gap-2 text-xs">
+              {routeDistance?.status === 'road_distance' ? (
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-2 font-extrabold text-blue-950 text-sm tabular-nums">
+                    <span>{routeDistance.formattedDistance}</span>
+                    {routeDistance.formattedDuration && (
+                      <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-lg border border-blue-200">
+                        الزمن المتوقع: {routeDistance.formattedDuration}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-neutral-500">
+                    محسوبة فعليًا على شبكة الطرق ({routeDistance.provider || 'google'} / {routeDistance.engine || 'routes_api'})
+                  </p>
+                </div>
+              ) : (
+                <div className="text-xs text-slate-700 font-bold">
+                  <span>{!navEval.allowed ? 'الملاحة متوقفة من الإعدادات المركزية' : routeDistance?.formattedDistance || 'مسافة الطريق غير متاحة'}</span>
+                  {routeDistance?.errorReason && (
+                    <p className="text-[11px] text-slate-500 font-normal mt-0.5">{routeDistance.errorReason}</p>
+                  )}
+                </div>
+              )}
+
+              {activeSession && (
+                <div className="flex items-center gap-2">
+                  <span className="px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-900 border border-emerald-300 text-[11px] font-bold">
+                    جلسة ملاحة نشطة ({activeSession.status === 'recalculated' ? 'محدّثة' : 'نشطة'})
+                  </span>
+                  <button
+                    type="button"
+                    disabled={isUpdatingSession}
+                    onClick={handleStopNavigationSession}
+                    className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <Square className="w-3 h-3" />
+                    <span>إيقاف الجلسة</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
 
           {/* 1. Driver GPS Location Card */}
           <div className="bg-emerald-50/70 border border-emerald-200 rounded-2xl p-4 space-y-2">
@@ -294,12 +419,13 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
                 {pickupCoords && (
                   <button
                     type="button"
+                    disabled={!navEval.allowed || isUpdatingSession}
                     onClick={() => handleStartNavigation(pickupCoords, pickupName)}
-                    className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 active:scale-95 text-white rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-xs"
-                    title="فتح الملاحة بالـ GPS إلى موقع المطعم / الصيدلية"
+                    className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 disabled:text-slate-500 active:scale-95 text-white rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-xs"
+                    title={navEval.allowed ? 'بدء الملاحة بالـ GPS إلى موقع الاستلام' : navEval.reason}
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
-                    <span>بدء الملاحة للاستلام</span>
+                    <span>{navEval.allowed ? 'بدء الملاحة للاستلام' : 'الملاحة متوقفة'}</span>
                   </button>
                 )}
               </div>
@@ -335,12 +461,13 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
               {customerCoords && (
                 <button
                   type="button"
+                  disabled={!navEval.allowed || isUpdatingSession}
                   onClick={() => handleStartNavigation(customerCoords, customerName)}
-                  className="px-3.5 py-1.5 bg-sky-700 hover:bg-sky-800 active:scale-95 text-white rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-xs"
-                  title="فتح الملاحة بالـ GPS إلى عنوان العميل"
+                  className="px-3.5 py-1.5 bg-sky-700 hover:bg-sky-800 disabled:bg-slate-300 disabled:text-slate-500 active:scale-95 text-white rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-xs"
+                  title={navEval.allowed ? 'بدء الملاحة بالـ GPS إلى عنوان العميل' : navEval.reason}
                 >
                   <ExternalLink className="w-3.5 h-3.5" />
-                  <span>بدء الملاحة للعميل</span>
+                  <span>{navEval.allowed ? 'بدء الملاحة للعميل' : 'الملاحة متوقفة'}</span>
                 </button>
               )}
             </div>
@@ -369,22 +496,33 @@ export const OrderMapModal: React.FC<OrderMapModalProps> = ({
             </div>
           </div>
 
-          {/* 4. Google Maps Environment Configuration Notice */}
-          <div className="p-3.5 bg-neutral-50 border border-neutral-200 rounded-2xl text-xs text-neutral-600 space-y-1">
+          {/* 4. Central Routing & Navigation Settings Info */}
+          <div className="p-3.5 bg-neutral-50 border border-neutral-200 rounded-2xl text-xs text-neutral-700 space-y-1.5">
             <div className="flex items-center space-x-2 space-x-reverse font-bold text-neutral-800">
               <Compass className="w-4 h-4 text-neutral-600" />
-              <span>حالة خريطة Google Maps التفاعلية:</span>
+              <span>حالة نظام الملاحة والتوجيه المركزي:</span>
             </div>
-            {hasMapsApiKey ? (
-              <p className="text-[11px] text-emerald-800">
-                مفتاح Google Maps مهيأ بنجاح في التطبيق.
-              </p>
-            ) : (
-              <p className="text-[11px] text-neutral-500 leading-relaxed">
-                مفتاح Google Maps API غير مهيأ في متغيرات البيئة (VITE_GOOGLE_MAPS_API_KEY غير متوفر). تم
-                توفير الملاحة المباشرة الدقيقة وتتبع إشارة الـ GPS لجهاز السائق بكفاءة ودون أي توقف في وظائف التطبيق.
-              </p>
-            )}
+            <div className="grid grid-cols-2 gap-2 text-[11px] pt-1">
+              <div>
+                <span className="text-neutral-500">حالة الملاحة: </span>
+                <strong className={navEval.allowed ? 'text-emerald-700' : 'text-rose-700'}>
+                  {systemSettings?.navigation_enabled === true
+                    ? 'مفعّلة'
+                    : systemSettings?.navigation_enabled === false
+                    ? 'متوقفة من الإدارة'
+                    : 'غير محددة'}
+                </strong>
+              </div>
+              <div>
+                <span className="text-neutral-500">المزود / المحرك: </span>
+                <strong className="font-mono">
+                  {systemSettings?.routing_provider || '-'} / {systemSettings?.routing_engine || '-'}
+                </strong>
+              </div>
+            </div>
+            <p className="text-[11px] text-neutral-500 leading-relaxed">
+              يتم حساب مسافة الطريق الفعلي عبر الخادم (Edge Function) لحماية المفاتيح السرية وعدم كشفها في الواجهة.
+            </p>
           </div>
         </div>
 

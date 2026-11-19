@@ -16,14 +16,17 @@ import {
   Clock,
 } from 'lucide-react';
 import { PharmacyOrder, PharmacyOrderStatus } from '../../types/pharmacy';
+import type { RouteDistanceResult } from '../../types';
 import type { DriverGPSLocation } from '../../lib/gpsService';
-import { computeOrderDistanceFromDriver } from '../../lib/orderDisplayHelpers';
 import { formatSafeTime, formatSafeDateTime } from '../../App';
 
 interface PharmacyOrderCardProps {
   order: PharmacyOrder;
   currentDriverId?: string | null;
   driverLocation?: DriverGPSLocation | null;
+  routeDistance?: RouteDistanceResult | null;
+  sequenceNumber?: number;
+  navigationEnabled?: boolean;
   canAccept: boolean;
   isWorking?: boolean;
   isActionLoading: boolean;
@@ -80,7 +83,9 @@ export function getPharmacyStatusBadge(status: PharmacyOrderStatus) {
 export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
   order,
   currentDriverId,
-  driverLocation,
+  routeDistance,
+  sequenceNumber,
+  navigationEnabled = true,
   canAccept,
   isWorking = true,
   isActionLoading,
@@ -114,12 +119,17 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
       (i) => i.status === 'unavailable' && i.purchased_quantity === 0
     );
 
-  // Distance strictly from driver GPS location to customer delivery coordinates
-  const distanceInfo = computeOrderDistanceFromDriver(
-    order,
-    'pharmacy',
-    driverLocation
-  );
+  // Road distance strictly from driver GPS location to customer delivery coordinates
+  const hasRoadDistance = routeDistance?.status === 'road_distance';
+  const distanceLabel = hasRoadDistance
+    ? `${routeDistance.formattedDistance}${
+        routeDistance.formattedDuration ? ` • ${routeDistance.formattedDuration}` : ''
+      }`
+    : routeDistance?.status === 'loading'
+    ? 'جاري حساب الطريق...'
+    : routeDistance?.status === 'disabled' || !navigationEnabled
+    ? 'الملاحة متوقفة'
+    : 'مسافة الطريق غير متاحة';
 
   const PREVIEW_LIMIT = 2;
   const hasMoreItems = order.items.length > PREVIEW_LIMIT;
@@ -132,6 +142,11 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
       {/* Calm Green Accent Header Strip */}
       <div className="px-4 py-3 bg-emerald-50/70 border-b border-emerald-100 flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2 flex-wrap">
+          {typeof sequenceNumber === 'number' && (
+            <span className="font-mono text-[11px] font-extrabold px-2 py-0.5 rounded-lg bg-slate-800 text-white">
+              #{sequenceNumber}
+            </span>
+          )}
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 text-white text-[11px] font-bold">
             <Pill className="w-3.5 h-3.5" />
             <span>الصيدلية</span>
@@ -189,14 +204,17 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
 
             <div
               className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border tabular-nums ${
-                distanceInfo.available
+                hasRoadDistance
                   ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
                   : 'bg-slate-100 text-slate-500 border-slate-200'
               }`}
-              title="المسافة من موقعك الحالي إلى عنوان العميل"
+              title={
+                routeDistance?.errorReason ||
+                'مسافة الطريق الفعلي من موقعك الحالي إلى عنوان العميل'
+              }
             >
               <Navigation className="w-3.5 h-3.5 shrink-0" />
-              <span>{distanceInfo.formatted}</span>
+              <span>{distanceLabel}</span>
             </div>
           </div>
 
