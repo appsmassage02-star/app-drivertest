@@ -1,10 +1,9 @@
 import React from 'react';
 import { UtensilsCrossed, RefreshCw } from 'lucide-react';
-import { AppSectionSettingsState, DeliveryOrder, RouteDistanceResult } from '../../types';
+import { AppSectionSettingsState, DeliveryOrder } from '../../types';
 import { RestaurantOrderCard } from './RestaurantOrderCard';
 import { RestaurantOrderDetailsModal } from './RestaurantOrderDetailsModal';
 import type { DeliveryDriver } from '../../App';
-import type { DriverGPSLocation } from '../../lib/gpsService';
 import { evaluateSectionOperationalStatus } from '../../lib/sectionSettingsService';
 import { sortOrdersOldestFirst } from '../../lib/orderDisplayHelpers';
 
@@ -12,9 +11,6 @@ interface RestaurantOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
   searchQuery: string;
   currentDriver: DeliveryDriver | null;
-  driverLocation?: DriverGPSLocation | null;
-  routeDistances?: Record<string, RouteDistanceResult>;
-  navigationEnabled?: boolean;
   hideCardsList?: boolean;
   isWorking?: boolean;
   deliveryEnabled: boolean;
@@ -38,14 +34,12 @@ interface RestaurantOrdersSectionProps {
   onOpenCancellationModal: (order: DeliveryOrder) => void;
   onCallPhone: (phone: string) => void;
   onOpenMap?: (order: DeliveryOrder) => void;
+  onStartDelivery?: (order: DeliveryOrder) => void;
 }
 
 export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = ({
   activeTab,
   currentDriver,
-  driverLocation = null,
-  routeDistances = {},
-  navigationEnabled = true,
   hideCardsList = false,
   isWorking = true,
   deliveryEnabled,
@@ -64,6 +58,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
   onOpenCancellationModal,
   onCallPhone,
   onOpenMap,
+  onStartDelivery,
 }) => {
   if (!['pending', 'accepted', 'completed', 'cancelled'].includes(activeTab)) {
     return null;
@@ -176,16 +171,14 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
                   key={order.id}
                   order={order}
                   currentDriverId={currentDriver?.id}
-                  driverLocation={driverLocation}
-                  routeDistance={routeDistances[`restaurant:${order.id}`]}
                   sequenceNumber={idx + 1}
-                  navigationEnabled={navigationEnabled}
                   canAccept={canAcceptBase && order.status === 'pending_review'}
                   isWorking={isWorking}
                   isActionLoading={isActionLoading}
                   onOpenDetails={onSelectOrder}
                   onAcceptOrder={onAcceptOrder}
                   onStartShopping={onStartShopping}
+                  onStartDelivery={onStartDelivery}
                   onCompleteOrder={onCompleteOrder}
                   onRequestCancellation={onOpenCancellationModal}
                   onCallPhone={onCallPhone}
@@ -215,6 +208,7 @@ export const RestaurantOrdersSection: React.FC<RestaurantOrdersSectionProps> = (
         onOpenCancellationModal={onOpenCancellationModal}
         onCallPhone={onCallPhone}
         onOpenMap={onOpenMap}
+        onStartDelivery={onStartDelivery}
       />
     </div>
   );

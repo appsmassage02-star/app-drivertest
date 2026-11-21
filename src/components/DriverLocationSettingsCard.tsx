@@ -1,192 +1,49 @@
 import React from 'react';
-import {
-  LocateFixed,
-  RefreshCw,
-  CheckCircle2,
-  AlertTriangle,
-  MapPin,
-  ShieldCheck,
-} from 'lucide-react';
-import type { DriverGPSLocation, GPSStatus } from '../lib/gpsService';
-import type { TrackingPersistResult } from '../lib/driverTrackingService';
-import type { CentralGeoContext, DeliverySystemSettings } from '../types';
+import { MapPin, ShieldCheck, Navigation } from 'lucide-react';
+import type { CentralGeoContext } from '../types';
 
 interface DriverLocationSettingsCardProps {
-  driverLocation: DriverGPSLocation | null;
-  gpsStatus: GPSStatus;
-  gpsErrorMessage: string | null;
-  isLoadingGPS: boolean;
-  isTrackingActive: boolean;
-  trackingAccuracyWarning: string | null;
-  lastTrackingResult: TrackingPersistResult | null;
-  systemSettings: DeliverySystemSettings;
   centralGeoContext: CentralGeoContext;
-  onRefreshGPS: () => void;
 }
 
 export const DriverLocationSettingsCard: React.FC<
   DriverLocationSettingsCardProps
-> = ({
-  driverLocation,
-  gpsStatus,
-  gpsErrorMessage,
-  isLoadingGPS,
-  isTrackingActive,
-  trackingAccuracyWarning,
-  lastTrackingResult,
-  systemSettings,
-  centralGeoContext,
-  onRefreshGPS,
-}) => {
-  const permissionStateLabel =
-    gpsStatus === 'granted'
-      ? 'مفعّل ومتصل'
-      : gpsStatus === 'requesting'
-      ? 'جاري طلب الإذن والقراءة...'
-      : gpsStatus === 'denied'
-      ? 'إذن الموقع مرفوض من المتصفح/الجهاز'
-      : gpsStatus === 'rejected_accuracy'
-      ? 'دقة الإشارة أقل من الحد المعتمد'
-      : gpsStatus === 'rejected_mock'
-      ? 'تم رفض موقع وهمي'
-      : gpsStatus === 'unavailable'
-      ? 'خدمة GPS غير متوفرة'
-      : gpsStatus === 'timeout'
-      ? 'انتهت مهلة قراءة الموقع'
-      : 'في انتظار تحديد الموقع';
-
-  const statusTone =
-    gpsStatus === 'granted' && driverLocation
-      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-      : gpsStatus === 'denied' || gpsStatus === 'unavailable'
-      ? 'bg-rose-50 text-rose-800 border-rose-200'
-      : 'bg-amber-50 text-amber-800 border-amber-200';
+> = ({ centralGeoContext }) => {
+  const activeCoverageCount = centralGeoContext.coverageRows.filter(
+    (c) => c.is_active
+  ).length;
 
   return (
     <section
-      aria-label="الموقع وGPS والتغطية الجغرافية"
+      aria-label="نطاق التغطية الجغرافية والملاحة"
       className="bg-white rounded-3xl border border-slate-200 p-5 sm:p-6 shadow-xs space-y-4"
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-2xl bg-blue-50 border border-blue-200 text-blue-600 flex items-center justify-center shrink-0">
-            <LocateFixed className="w-5 h-5" />
+            <MapPin className="w-5 h-5" />
           </div>
           <div>
             <h2 className="text-sm sm:text-base font-extrabold text-slate-900">
-              الموقع وGPS والتغطية الجغرافية
+              نطاق التغطية الجغرافية والملاحة
             </h2>
             <p className="text-xs text-slate-500">
-              حالة إذن الموقع، دقة إحداثيات الجهاز لحساب المسافات، ونطاق التغطية المركزي
+              مناطق العمل المعتمدة وإرشاد التوصيل عبر خرائط Google باستخدام إحداثيات العميل
             </p>
           </div>
         </div>
-
-        <button
-          type="button"
-          onClick={onRefreshGPS}
-          disabled={isLoadingGPS}
-          className="min-h-[40px] px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer shrink-0 shadow-xs"
-        >
-          <RefreshCw
-            className={`w-3.5 h-3.5 ${isLoadingGPS ? 'animate-spin' : ''}`}
-          />
-          <span>{isLoadingGPS ? 'جاري التحديد...' : 'تحديث الـ GPS'}</span>
-        </button>
       </div>
 
-      {/* GPS Status & Coordinates Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-        <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-1.5">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-slate-500 font-semibold">حالة إذن GPS:</span>
-            <span
-              className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${statusTone}`}
-            >
-              {permissionStateLabel}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-slate-500 font-semibold">حالة التتبع المركزي:</span>
-            <span className="font-bold text-slate-800">
-              {isTrackingActive
-                ? 'نشط ومسجل بالخادم (الواجهة فقط)'
-                : systemSettings.driver_tracking_enabled === false
-                ? 'متوقف من الإعدادات المركزية'
-                : systemSettings.load_state !== 'loaded'
-                ? 'تعذر التحقق من الإعدادات'
-                : 'قراءة محلية لحساب المسافات'}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
-            <span>الفاصل الزمني للتتبع:</span>
-            <span className="font-mono font-bold">
-              {systemSettings.driver_location_update_interval_seconds != null &&
-              systemSettings.driver_tracking_enabled === true
-                ? `كل ${systemSettings.driver_location_update_interval_seconds} ثانية`
-                : 'غير مفعل'}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
-            <span>الملاحة ومسافة الطريق:</span>
-            <span className={`font-bold ${systemSettings.navigation_enabled ? 'text-emerald-700' : 'text-slate-600'}`}>
-              {systemSettings.navigation_enabled === true
-                ? `مفعّلة (${systemSettings.routing_provider || 'google'})`
-                : systemSettings.navigation_enabled === false
-                ? 'متوقفة من الإدارة'
-                : 'غير محددة'}
-            </span>
-          </div>
-
-          {systemSettings.max_accepted_gps_accuracy_m != null && (
-            <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
-              <span>حد الدقة المعتمد بالنظام:</span>
-              <span className="font-mono font-bold">
-                ±{systemSettings.max_accepted_gps_accuracy_m}m
-              </span>
-            </div>
-          )}
-        </div>
-
-        <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-1.5">
-          {driverLocation ? (
-            <>
-              <div className="flex items-center gap-1.5 text-emerald-700 font-bold">
-                <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>إحداثيات GPS الحقيقية متاحة</span>
-              </div>
-              <div
-                className="font-mono text-[11px] text-slate-700 bg-white px-2.5 py-1.5 rounded-xl border border-slate-200/80 tabular-nums"
-                dir="ltr"
-              >
-                {driverLocation.latitude.toFixed(5)},{' '}
-                {driverLocation.longitude.toFixed(5)} • ±
-                {Math.round(driverLocation.accuracy)}m
-              </div>
-            </>
-          ) : (
-            <div className="flex items-start gap-2 text-amber-900">
-              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-              <div className="text-[11px] leading-relaxed">
-                <strong className="block font-bold">
-                  إحداثيات السائق غير متاحة حاليًا
-                </strong>
-                <span>
-                  {trackingAccuracyWarning ||
-                    gpsErrorMessage ||
-                    'اضغط على «تحديث الـ GPS» لتمكين حساب المسافات نحو الطلبات.'}
-                </span>
-              </div>
-            </div>
-          )}
-          {lastTrackingResult && lastTrackingResult.status === 'db_error' && (
-            <div className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 px-2 py-1 rounded-lg">
-              {lastTrackingResult.message}
-            </div>
-          )}
+      {/* Navigation Mode Info */}
+      <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 flex items-start gap-2.5 text-xs text-slate-700">
+        <Navigation className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+        <div className="space-y-1">
+          <strong className="block font-bold text-slate-900">
+            الملاحة المباشرة عبر Google Maps فقط
+          </strong>
+          <p className="text-[11px] text-slate-600 leading-relaxed">
+            لا يتطلب التطبيق تشغيل الـ GPS أو منح أذونات الموقع لاستلام الطلبات أو التوصيل. عند الضغط على «بدء التوصيل»، يتم فتح خرائط Google مباشرة على إحداثيات العميل المحفوظة في الطلب.
+          </p>
         </div>
       </div>
 
@@ -198,8 +55,8 @@ export const DriverLocationSettingsCard: React.FC<
             <span>التغطية الجغرافية المركزية المعتمدة</span>
           </div>
           <span
-            className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold border inline-flex items-center gap-1 ${
-              centralGeoContext.coverageRows.filter((c) => c.is_active).length > 0
+            className={`px-2.5 py-0.5 rounded-lg text-[11px] font-bold border inline-flex items-center gap-1 tabular-nums ${
+              activeCoverageCount > 0
                 ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
                 : 'bg-amber-50 text-amber-800 border-amber-200'
             }`}
@@ -210,7 +67,7 @@ export const DriverLocationSettingsCard: React.FC<
                 ? 'تغطية سائق مطعم'
                 : 'تغطية سائق منصة'}
               {' • '}
-              {centralGeoContext.coverageRows.filter((c) => c.is_active).length} نطاق نشط
+              {activeCoverageCount} نطاق نشط
             </span>
           </span>
         </div>
@@ -240,7 +97,7 @@ export const DriverLocationSettingsCard: React.FC<
               );
             })}
             {centralGeoContext.coverageRows.length > 8 && (
-              <span className="text-[11px] font-bold text-blue-700 px-2 py-1">
+              <span className="text-[11px] font-bold text-blue-700 px-2 py-1 tabular-nums">
                 +{centralGeoContext.coverageRows.length - 8} مناطق أخرى
               </span>
             )}

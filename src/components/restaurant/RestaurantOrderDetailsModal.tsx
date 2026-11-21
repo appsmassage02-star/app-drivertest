@@ -13,6 +13,7 @@ import {
   Bike,
   ShieldCheck,
   CheckSquare,
+  Navigation,
 } from 'lucide-react';
 import { DeliveryOrder } from '../../types';
 import {
@@ -41,6 +42,7 @@ interface RestaurantOrderDetailsModalProps {
   onOpenCancellationModal: (order: DeliveryOrder) => void;
   onCallPhone: (phone: string) => void;
   onOpenMap?: (order: DeliveryOrder) => void;
+  onStartDelivery?: (order: DeliveryOrder) => void;
 }
 
 export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalProps> = ({
@@ -58,6 +60,7 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
   onOpenCancellationModal,
   onCallPhone,
   onOpenMap,
+  onStartDelivery,
 }) => {
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [itemPriceInput, setItemPriceInput] = useState<string>('');
@@ -512,11 +515,11 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
               <button
                 type="button"
                 onClick={() => onOpenMap(order)}
-                className="px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
-                title="فتح شاشة الخرائط وملاحة الـ GPS"
+                className="min-h-[44px] px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs whitespace-nowrap"
+                title="عرض موقع العميل على الخريطة"
               >
                 <MapPin className="w-3.5 h-3.5 text-emerald-700" />
-                <span>الخريطة والملاحة</span>
+                <span>خريطة الوجهة</span>
               </button>
             )}
 
@@ -587,15 +590,30 @@ export const RestaurantOrderDetailsModal: React.FC<RestaurantOrderDetailsModalPr
 
             {/* Complete Delivery and COD collection */}
             {order.status === 'shopping_completed' && isAssignedToMe && (
-              <button
-                type="button"
-                disabled={isActionLoading}
-                onClick={() => onCompleteOrder(order)}
-                className="px-5 py-2.5 bg-emerald-700 hover:bg-emerald-800 active:scale-95 disabled:bg-neutral-300 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center space-x-1.5 space-x-reverse cursor-pointer"
-              >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>تأكيد التسليم للعميل وتحصيل الكاش</span>
-              </button>
+              <>
+                {(onStartDelivery || onOpenMap) && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onStartDelivery ? onStartDelivery(order) : onOpenMap?.(order)
+                    }
+                    className="min-h-[44px] px-4 py-2.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl text-xs font-extrabold shadow-xs transition flex items-center space-x-1.5 space-x-reverse cursor-pointer whitespace-nowrap"
+                  >
+                    <Navigation className="w-4 h-4" />
+                    <span>بدء التوصيل</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  disabled={isActionLoading}
+                  onClick={() => onCompleteOrder(order)}
+                  className="min-h-[44px] px-5 py-2.5 bg-emerald-700 hover:bg-emerald-800 active:scale-95 disabled:bg-neutral-300 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center space-x-1.5 space-x-reverse cursor-pointer whitespace-nowrap"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>تأكيد التسليم للعميل وتحصيل الكاش</span>
+                </button>
+              </>
             )}
 
             <button

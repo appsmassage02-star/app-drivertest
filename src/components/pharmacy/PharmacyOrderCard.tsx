@@ -16,23 +16,19 @@ import {
   Clock,
 } from 'lucide-react';
 import { PharmacyOrder, PharmacyOrderStatus } from '../../types/pharmacy';
-import type { RouteDistanceResult } from '../../types';
-import type { DriverGPSLocation } from '../../lib/gpsService';
 import { formatSafeTime, formatSafeDateTime } from '../../App';
 
 interface PharmacyOrderCardProps {
   order: PharmacyOrder;
   currentDriverId?: string | null;
-  driverLocation?: DriverGPSLocation | null;
-  routeDistance?: RouteDistanceResult | null;
   sequenceNumber?: number;
-  navigationEnabled?: boolean;
   canAccept: boolean;
   isWorking?: boolean;
   isActionLoading: boolean;
   onOpenDetails: (order: PharmacyOrder) => void;
   onAcceptOrder: (order: PharmacyOrder) => void;
   onStartShopping: (order: PharmacyOrder) => void;
+  onStartDelivery?: (order: PharmacyOrder) => void;
   onCompleteDelivery: (orderId: string) => void;
   onRequestCancellation: (order: PharmacyOrder) => void;
   onCallCustomer: (phone: string) => void;
@@ -83,15 +79,14 @@ export function getPharmacyStatusBadge(status: PharmacyOrderStatus) {
 export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
   order,
   currentDriverId,
-  routeDistance,
   sequenceNumber,
-  navigationEnabled = true,
   canAccept,
   isWorking = true,
   isActionLoading,
   onOpenDetails,
   onAcceptOrder,
   onStartShopping,
+  onStartDelivery,
   onCompleteDelivery,
   onRequestCancellation,
   onCallCustomer,
@@ -118,18 +113,6 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
     order.items.every(
       (i) => i.status === 'unavailable' && i.purchased_quantity === 0
     );
-
-  // Road distance strictly from driver GPS location to customer delivery coordinates
-  const hasRoadDistance = routeDistance?.status === 'road_distance';
-  const distanceLabel = hasRoadDistance
-    ? `${routeDistance.formattedDistance}${
-        routeDistance.formattedDuration ? ` • ${routeDistance.formattedDuration}` : ''
-      }`
-    : routeDistance?.status === 'loading'
-    ? 'جاري حساب الطريق...'
-    : routeDistance?.status === 'disabled' || !navigationEnabled
-    ? 'الملاحة متوقفة'
-    : 'مسافة الطريق غير متاحة';
 
   const PREVIEW_LIMIT = 2;
   const hasMoreItems = order.items.length > PREVIEW_LIMIT;
@@ -179,7 +162,7 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
       </div>
 
       <div className="p-4 sm:p-5 space-y-3.5">
-        {/* Requested Pharmacy / Customer + GPS Distance */}
+        {/* Requested Pharmacy / Customer */}
         <div className="bg-slate-50/80 rounded-xl p-3.5 border border-slate-200/70 space-y-2 text-xs">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2 min-w-0">
@@ -200,21 +183,6 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
                     : order.customer_name}
                 </strong>
               </div>
-            </div>
-
-            <div
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border tabular-nums ${
-                hasRoadDistance
-                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                  : 'bg-slate-100 text-slate-500 border-slate-200'
-              }`}
-              title={
-                routeDistance?.errorReason ||
-                'مسافة الطريق الفعلي من موقعك الحالي إلى عنوان العميل'
-              }
-            >
-              <Navigation className="w-3.5 h-3.5 shrink-0" />
-              <span>{distanceLabel}</span>
             </div>
           </div>
 
@@ -485,15 +453,30 @@ export const PharmacyOrderCard: React.FC<PharmacyOrderCardProps> = ({
           )}
 
           {canComplete && (
-            <button
-              type="button"
-              disabled={isActionLoading}
-              onClick={() => onCompleteDelivery(order.id)}
-              className="min-h-[40px] px-4 py-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center gap-1.5 cursor-pointer"
-            >
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              <span>إتمام التوصيل</span>
-            </button>
+            <>
+              {(onStartDelivery || onOpenMap) && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    onStartDelivery ? onStartDelivery(order) : onOpenMap?.(order)
+                  }
+                  className="min-h-[44px] px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl text-xs font-extrabold shadow-xs transition flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Navigation className="w-3.5 h-3.5" />
+                  <span>بدء التوصيل</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                disabled={isActionLoading}
+                onClick={() => onCompleteDelivery(order.id)}
+                className="min-h-[44px] px-4 py-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>إتمام التوصيل</span>
+              </button>
+            </>
           )}
 
           {canRequestCancel && (

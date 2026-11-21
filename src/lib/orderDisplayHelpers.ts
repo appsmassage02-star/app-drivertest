@@ -89,59 +89,17 @@ export function getOrderDistanceTargetCoordinates(
 }
 
 /**
- * Computes distance strictly from real driver GPS coordinates and real target coordinates.
- * Never invents fallback numbers (such as legacy hardcoded 4.2 km).
+ * Driver-to-order distance computation is disabled in favor of direct Google Maps customer navigation.
  */
 export function computeOrderDistanceFromDriver(
-  order: any,
-  orderType: OrderCategoryKind,
-  driverLocation: DriverGPSLocation | null | undefined
+  _order: any,
+  _orderType: OrderCategoryKind,
+  _driverLocation: DriverGPSLocation | null | undefined
 ): OrderDistanceDisplay {
-  if (
-    !driverLocation ||
-    !isValidCoordinate(driverLocation.latitude, driverLocation.longitude)
-  ) {
-    return {
-      available: false,
-      distanceKm: null,
-      formatted: 'المسافة غير متاحة',
-    };
-  }
-
-  const targetCoords = getOrderDistanceTargetCoordinates(order, orderType);
-  if (
-    !targetCoords ||
-    !isValidCoordinate(targetCoords.latitude, targetCoords.longitude)
-  ) {
-    return {
-      available: false,
-      distanceKm: null,
-      formatted: 'المسافة غير متاحة',
-    };
-  }
-
-  const km = calculateHaversineDistanceKm(
-    driverLocation.latitude,
-    driverLocation.longitude,
-    targetCoords.latitude,
-    targetCoords.longitude
-  );
-
-  if (!Number.isFinite(km) || km < 0) {
-    return {
-      available: false,
-      distanceKm: null,
-      formatted: 'المسافة غير متاحة',
-    };
-  }
-
-  const formatted =
-    km < 1 ? `${Math.round(km * 1000)} م` : `${km.toFixed(1)} كم`;
-
   return {
-    available: true,
-    distanceKm: km,
-    formatted,
+    available: false,
+    distanceKm: null,
+    formatted: '',
   };
 }
 

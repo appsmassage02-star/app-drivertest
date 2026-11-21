@@ -18,7 +18,6 @@ import {
   fetchAppSectionSettings,
 } from '../lib/sectionSettingsService';
 import { getSupabaseClient, isSupabaseConfigured } from '../services/supabaseClient';
-import { endNavigationSession } from '../lib/navigationService';
 
 interface UsePharmacyOptions {
   currentDriver: DeliveryDriver | null;
@@ -858,12 +857,6 @@ export function usePharmacy({
           currentDriver.id,
           note
         );
-        void endNavigationSession({
-          supabase: getSupabaseClient(),
-          driverId: currentDriver.id,
-          orderId,
-          endStatus: 'cancelled',
-        });
         syncUpdatedOrderInState(updated);
         notify('تم تسجيل التواصل مع العميل وتحديث حالة الطلب لعدم توفر جميع الأصناف.', 'info');
       } catch (err: any) {
@@ -898,22 +891,10 @@ export function usePharmacy({
               };
             })
           );
-          void endNavigationSession({
-            supabase: getSupabaseClient(),
-            driverId: currentDriver.id,
-            orderId,
-            endStatus: 'completed',
-          });
           notify('تم تأكيد تسليم فاتورة الصيدلية محليًا (أوفلاين) وسيتم المزامنة فور عودة الاتصال.', 'info');
           return;
         }
         const updated = await pharmacyService.completeDelivery(orderId, currentDriver.id);
-        void endNavigationSession({
-          supabase: getSupabaseClient(),
-          driverId: currentDriver.id,
-          orderId,
-          endStatus: 'completed',
-        });
         syncUpdatedOrderInState(updated);
         notify('تم إتمام توصيل فاتورة الصيدلية للعميل بنجاح (completed).', 'success');
       } catch (err: any) {
@@ -937,12 +918,6 @@ export function usePharmacy({
           reasonCategory,
           reasonText
         );
-        void endNavigationSession({
-          supabase: getSupabaseClient(),
-          driverId: currentDriver.id,
-          orderId,
-          endStatus: 'cancelled',
-        });
         syncUpdatedOrderInState(updated);
         notify('تم إرسال طلب الإلغاء للمراجعة الإدارية بنجاح.', 'info');
         return true;

@@ -48,7 +48,6 @@ import {
   Pill,
   Activity,
   UtensilsCrossed,
-  LocateFixed,
   Bell,
   Wallet,
   Landmark,
@@ -81,7 +80,6 @@ import {
   isOrderEligibleForDriver,
   extractOrderFinancialBreakdown,
 } from './lib/geoCoverageService';
-import { fetchDeliverySystemSettings } from './lib/driverTrackingService';
 import {
   createEmptyAppSectionSettingsState,
   evaluateSectionOperationalStatus,
@@ -91,18 +89,12 @@ import {
 import { SectionStatusPanel } from './components/SectionStatusPanel';
 import { usePharmacy } from './hooks/usePharmacy';
 import { useDriverAuth } from './hooks/useDriverAuth';
-import { useDriverGPS } from './hooks/useDriverGPS';
-import { useOrderRouteDistances, getOrderRouteKey } from './hooks/useOrderRouteDistances';
-import {
-  clearNavigationSessionCache,
-  endNavigationSession,
-  sharedRouteDistanceManager,
-} from './lib/navigationService';
+import { MISSING_DESTINATION_COORDS_MESSAGE } from './lib/gpsService';
+import { launchCustomerDeliveryMaps } from './lib/navigationService';
 import type {
   AppSectionSettingsState,
   CentralGeoContext,
   DeliveryDriver,
-  DeliverySystemSettings,
   DriverStatus,
   GeoCenter,
   GeoGovernorate,
@@ -400,17 +392,6 @@ export default function App() {
   const centralGeoContextRef = useRef<CentralGeoContext>(centralGeoContext);
   centralGeoContextRef.current = centralGeoContext;
 
-  const [systemSettings, setSystemSettings] = useState<DeliverySystemSettings>({
-    driver_tracking_enabled: null,
-    navigation_enabled: null,
-    routing_provider: null,
-    routing_engine: null,
-    driver_location_update_interval_seconds: null,
-    max_accepted_gps_accuracy_m: null,
-    route_deviation_threshold_m: null,
-    load_state: 'idle',
-  });
-
   // Central Sections & Delivery Operational Settings State (read directly from public.app_section_settings, no localStorage cache)
   const [sectionSettings, setSectionSettings] = useState<AppSectionSettingsState>(() =>
     createEmptyAppSectionSettingsState('idle')
@@ -517,34 +498,6 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 4000);
   }, []);
 
-  // Active assigned order ID (if any) for GPS tracking telemetry context
-  const activeAssignedOrderId = useMemo(() => {
-    if (!currentDriver?.id) return null;
-    const activeOrder = orders.find(
-      (o) =>
-        o.assigned_driver_id === currentDriver.id &&
-        (o.status === 'accepted' || o.status === 'shopping' || o.status === 'shopping_completed')
-    );
-    return activeOrder ? activeOrder.id : null;
-  }, [orders, currentDriver?.id]);
-
-  // Driver Real Hardware GPS Hook (independent of maps, validates & persists via delivery_system_settings)
-  const {
-    driverLocation,
-    gpsStatus,
-    gpsErrorMessage,
-    isLoadingGPS,
-    isTrackingActive,
-    trackingAccuracyWarning,
-    lastTrackingResult,
-    requestGPSLocation,
-  } = useDriverGPS(isWorking, {
-    supabase: getClient(),
-    driverId: currentDriver?.id || null,
-    systemSettings,
-    activeOrderId: activeAssignedOrderId,
-  });
-
   // Order Category Filter ('all' | 'regular' | 'restaurant' | 'pharmacy')
   const [orderCategoryView, setOrderCategoryView] = useState<'all' | 'regular' | 'restaurant' | 'pharmacy'>('all');
   const [selectedRestaurantOrder, setSelectedRestaurantOrder] = useState<DeliveryOrder | null>(null);
@@ -552,7 +505,23 @@ export default function App() {
   const [mapModalTarget, setMapModalTarget] = useState<{
     order: any;
     orderType: 'restaurant' | 'pharmacy' | 'regular';
+    autoLaunchedExternal?: boolean;
   } | null>(null);
+
+  // Opens Google Maps strictly with customer coordinates on "بدء التوصيل" (never alters order status or requires GPS)
+  const handleStartDeliveryNavigation = useCallback(
+    (order: any, orderType: 'restaurant' | 'pharmacy' | 'regular') => {
+      const res = launchCustomerDeliveryMaps(order);
+      if (!res.success) {
+        showToast(res.errorMessage || MISSING_DESTINATION_COORDS_MESSAGE, 'error');
+        setMapModalTarget({ order, orderType, autoLaunchedExternal: false });
+        return;
+      }
+      showToast('تم فتح خرائط Google على موقع العميل.', 'info');
+      setMapModalTarget({ order, orderType, autoLaunchedExternal: true });
+    },
+    [showToast]
+  );
 
   // Isolated Pharmacy Driver Hook
   const {
@@ -600,16 +569,6 @@ export default function App() {
       setSectionSettings(fresh);
     },
     onToast: showToast,
-  });
-
-  // Server-side Road Distance Manager for all visible/active orders across categories
-  const { routeDistances, recalculateOrderRoute } = useOrderRouteDistances({
-    supabase: getClient(),
-    driverId: currentDriver?.id || null,
-    driverLocation,
-    systemSettings,
-    orders,
-    pharmacyOrders,
   });
 
   // Lightbox Document Viewer Modal State
@@ -706,16 +665,15 @@ export default function App() {
         setHeaderImageSrc(newHeaderSrc);
       });
 
-      // 1. Fetch delivery_settings + delivery_system_settings + app_section_settings + central geo coverage
+      // 1. Fetch delivery_settings + app_section_settings + central geo coverage
       const activeDriver = currentDriverRef.current;
 
-      const [settingsRes, govSettingsRes, sysSettings, loadedSectionSettings, loadedGeoContext] = await Promise.all([
+      const [settingsRes, govSettingsRes, loadedSectionSettings, loadedGeoContext] = await Promise.all([
         supabase.from('delivery_settings').select('*').limit(1).maybeSingle(),
         supabase
           .from('delivery_governorate_settings')
           .select('*')
           .order('governorate_name', { ascending: true }),
-        fetchDeliverySystemSettings(supabase),
         fetchAppSectionSettings(supabase),
         activeDriver
           ? loadFullCentralGeoContext(supabase, activeDriver)
@@ -730,7 +688,6 @@ export default function App() {
         setGovernorates(govSettingsRes.data as DeliveryGovernorateSetting[]);
       }
 
-      setSystemSettings(sysSettings);
       sectionSettingsRef.current = loadedSectionSettings;
       setSectionSettings(loadedSectionSettings);
       centralGeoContextRef.current = loadedGeoContext;
@@ -923,16 +880,6 @@ export default function App() {
       const emptyCtx = createEmptyCentralGeoContext();
       centralGeoContextRef.current = emptyCtx;
       setCentralGeoContext(emptyCtx);
-      setSystemSettings({
-        driver_tracking_enabled: null,
-        navigation_enabled: null,
-        routing_provider: null,
-        routing_engine: null,
-        driver_location_update_interval_seconds: null,
-        max_accepted_gps_accuracy_m: null,
-        route_deviation_threshold_m: null,
-        load_state: 'idle',
-      });
       if (supabaseUser?.id) {
         void refreshSectionSettings();
       } else {
@@ -1677,13 +1624,6 @@ export default function App() {
 
     successfullyUploadedDocsRef.current.clear();
     acceptingOrderIdsRef.current.clear();
-    await endNavigationSession({
-      supabase: getClient(),
-      driverId: currentDriverRef.current?.id || null,
-      endStatus: 'stopped',
-    });
-    clearNavigationSessionCache();
-    sharedRouteDistanceManager.clear();
     await driverLogout();
     ordersService.cleanup();
     setOrders([]);
@@ -1693,16 +1633,6 @@ export default function App() {
     const emptyCtx = createEmptyCentralGeoContext();
     centralGeoContextRef.current = emptyCtx;
     setCentralGeoContext(emptyCtx);
-    setSystemSettings({
-      driver_tracking_enabled: null,
-      navigation_enabled: null,
-      routing_provider: null,
-      routing_engine: null,
-      driver_location_update_interval_seconds: null,
-      max_accepted_gps_accuracy_m: null,
-      route_deviation_threshold_m: null,
-      load_state: 'idle',
-    });
     const idleSections = createEmptyAppSectionSettingsState('idle');
     sectionSettingsRef.current = idleSections;
     setSectionSettings(idleSections);
@@ -2300,12 +2230,6 @@ export default function App() {
       };
 
       setOrderHistory((prev) => [newHist, ...prev]);
-      void endNavigationSession({
-        supabase,
-        driverId: currentDriver.id,
-        orderId: order.id,
-        endStatus: 'completed',
-      });
       showToast('تم إتمام التوصيل وتأكيد التسليم بنجاح.', 'success');
       await refreshOrderData(order.id);
     } catch (err: any) {
@@ -2400,12 +2324,6 @@ export default function App() {
     };
 
     setOrderHistory((prev) => [newHist, ...prev]);
-    void endNavigationSession({
-      supabase,
-      driverId: currentDriver.id,
-      orderId: cancelModalOrder.id,
-      endStatus: 'cancelled',
-    });
     setCancelModalOrder(null);
     setCancelReasonText('');
     showToast('تم إرسال طلب الإلغاء بنجاح وهو الآن في انتظار قرار الإدارة (cancellation_pending).', 'info');
@@ -4208,16 +4126,14 @@ export default function App() {
                         key={item.id}
                         order={pOrder}
                         currentDriverId={currentDriver?.id}
-                        driverLocation={driverLocation}
-                        routeDistance={routeDistances[getOrderRouteKey('pharmacy', pOrder.id)]}
                         sequenceNumber={idx + 1}
-                        navigationEnabled={systemSettings.navigation_enabled === true}
                         canAccept={canAcceptPharmacy}
                         isWorking={isWorking}
                         isActionLoading={isPharmacyActionLoading}
                         onOpenDetails={(ord) => setSelectedPharmacyOrder(ord)}
                         onAcceptOrder={acceptPharmacyOrder}
                         onStartShopping={startPharmacyShopping}
+                        onStartDelivery={(ord) => handleStartDeliveryNavigation(ord, 'pharmacy')}
                         onCompleteDelivery={completePharmacyDelivery}
                         onRequestCancellation={(ord) =>
                           setPharmacyCancelTarget(ord)
@@ -4244,16 +4160,14 @@ export default function App() {
                         key={item.id}
                         order={rOrder}
                         currentDriverId={currentDriver?.id}
-                        driverLocation={driverLocation}
-                        routeDistance={routeDistances[getOrderRouteKey('restaurant', rOrder.id)]}
                         sequenceNumber={idx + 1}
-                        navigationEnabled={systemSettings.navigation_enabled === true}
                         canAccept={canAcceptRest}
                         isWorking={isWorking}
                         isActionLoading={isActionLoading}
                         onOpenDetails={setSelectedRestaurantOrder}
                         onAcceptOrder={handleAcceptOrder}
                         onStartShopping={handleStartShopping}
+                        onStartDelivery={(ord) => handleStartDeliveryNavigation(ord, 'restaurant')}
                         onCompleteOrder={handleCompleteOrder}
                         onRequestCancellation={(ord) => setCancelModalOrder(ord)}
                         onCallPhone={callCustomer}
@@ -4277,16 +4191,14 @@ export default function App() {
                       key={item.id}
                       order={hOrder}
                       currentDriver={currentDriver}
-                      driverLocation={driverLocation}
-                      routeDistance={routeDistances[getOrderRouteKey('regular', hOrder.id)]}
                       sequenceNumber={idx + 1}
-                      navigationEnabled={systemSettings.navigation_enabled === true}
                       canAccept={canAcceptHome}
                       isWorking={isWorking}
                       isActionLoading={isActionLoading}
                       onOpenDetails={setSelectedOrder}
                       onAcceptOrder={handleAcceptOrder}
                       onStartShopping={handleStartShopping}
+                      onStartDelivery={(ord) => handleStartDeliveryNavigation(ord, 'regular')}
                       onCompleteOrder={handleCompleteOrder}
                       onRequestCancellation={(ord) => {
                         setCancelModalOrder(ord);
@@ -4313,9 +4225,6 @@ export default function App() {
               activeTab={activeTab}
               searchQuery={searchQuery}
               currentDriver={currentDriver}
-              driverLocation={driverLocation}
-              routeDistances={routeDistances}
-              navigationEnabled={systemSettings.navigation_enabled === true}
               hideCardsList={orderCategoryView === 'all'}
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
@@ -4334,6 +4243,7 @@ export default function App() {
               onRefreshPharmacyOrders={() => loadPharmacyOrders('تحديث يدوي')}
               onAcceptOrder={acceptPharmacyOrder}
               onStartShopping={startPharmacyShopping}
+              onStartDelivery={(ord) => handleStartDeliveryNavigation(ord, 'pharmacy')}
               onUpdateMedicineItem={updateMedicineItem}
               onSavePrescriptionImageNote={saveImageDriverNote}
               onAddVisitedPharmacy={addVisitedPharmacy}
@@ -4359,9 +4269,6 @@ export default function App() {
               activeTab={activeTab}
               searchQuery={searchQuery}
               currentDriver={currentDriver}
-              driverLocation={driverLocation}
-              routeDistances={routeDistances}
-              navigationEnabled={systemSettings.navigation_enabled === true}
               hideCardsList={orderCategoryView === 'all'}
               isWorking={isWorking}
               deliveryEnabled={Boolean(settings?.delivery_enabled)}
@@ -4374,6 +4281,7 @@ export default function App() {
               onSelectOrder={setSelectedRestaurantOrder}
               onAcceptOrder={handleAcceptOrder}
               onStartShopping={handleStartShopping}
+              onStartDelivery={(ord) => handleStartDeliveryNavigation(ord, 'restaurant')}
               onUpdateDeliveryItem={handleUpdateDeliveryItem}
               onCompleteShopping={handleCompleteShopping}
               onCompleteOrder={handleCompleteOrder}
@@ -4458,16 +4366,14 @@ export default function App() {
                       key={order.id}
                       order={order}
                       currentDriver={currentDriver}
-                      driverLocation={driverLocation}
-                      routeDistance={routeDistances[getOrderRouteKey('regular', order.id)]}
                       sequenceNumber={idx + 1}
-                      navigationEnabled={systemSettings.navigation_enabled === true}
                       canAccept={canAccept}
                       isWorking={isWorking}
                       isActionLoading={isActionLoading}
                       onOpenDetails={setSelectedOrder}
                       onAcceptOrder={handleAcceptOrder}
                       onStartShopping={handleStartShopping}
+                      onStartDelivery={(ord) => handleStartDeliveryNavigation(ord, 'regular')}
                       onCompleteOrder={handleCompleteOrder}
                       onRequestCancellation={(ord) => {
                         setCancelModalOrder(ord);
@@ -4741,19 +4647,10 @@ export default function App() {
         {/* ------------------------------------------------------------- */}
         {activeTab === 'settings' && (
           <div className="space-y-5">
-            {/* 1. Location & GPS Settings Card (Moved out of Home screen) */}
+            {/* 1. Central Geographic Coverage & Direct Maps Card */}
             {currentDriver && currentDriver.status === 'approved' && currentDriver.is_active && (
               <DriverLocationSettingsCard
-                driverLocation={driverLocation}
-                gpsStatus={gpsStatus}
-                gpsErrorMessage={gpsErrorMessage}
-                isLoadingGPS={isLoadingGPS}
-                isTrackingActive={isTrackingActive}
-                trackingAccuracyWarning={trackingAccuracyWarning}
-                lastTrackingResult={lastTrackingResult}
-                systemSettings={systemSettings}
                 centralGeoContext={centralGeoContext}
-                onRefreshGPS={() => void requestGPSLocation(false)}
               />
             )}
 
@@ -5267,15 +5164,25 @@ export default function App() {
                       </p>
                     </div>
                     {isSelectedOrderAssigned && (
-                      <button
-                        type="button"
-                        disabled={isActionLoading}
-                        onClick={() => handleCompleteOrder(selectedOrder)}
-                        className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 active:scale-95 disabled:bg-neutral-300 text-white rounded-xl text-xs font-bold transition shrink-0 cursor-pointer shadow-xs flex items-center justify-center space-x-1 space-x-reverse"
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>إتمام التوصيل</span>
-                      </button>
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleStartDeliveryNavigation(selectedOrder, 'regular')}
+                          className="min-h-[44px] px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl text-xs font-extrabold transition cursor-pointer shadow-xs flex items-center justify-center space-x-1.5 space-x-reverse whitespace-nowrap"
+                        >
+                          <Navigation className="w-3.5 h-3.5" />
+                          <span>بدء التوصيل</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isActionLoading}
+                          onClick={() => handleCompleteOrder(selectedOrder)}
+                          className="min-h-[44px] px-4 py-2 bg-emerald-700 hover:bg-emerald-800 active:scale-95 disabled:bg-neutral-300 text-white rounded-xl text-xs font-bold transition cursor-pointer shadow-xs flex items-center justify-center space-x-1.5 space-x-reverse whitespace-nowrap"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>إتمام التوصيل</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}
@@ -6014,28 +5921,14 @@ export default function App() {
         deliveryLastEventTime={deliveryLastEventTime}
       />
 
-      {/* Order GPS & External Navigation Modal */}
+      {/* Customer Destination Google Maps Modal */}
       <OrderMapModal
         isOpen={Boolean(mapModalTarget)}
         onClose={() => setMapModalTarget(null)}
         order={mapModalTarget?.order || null}
         orderType={mapModalTarget?.orderType || 'regular'}
-        driverLocation={driverLocation}
-        gpsStatus={gpsStatus}
-        gpsErrorMessage={gpsErrorMessage}
-        isLoadingGPS={isLoadingGPS}
-        systemSettings={systemSettings}
-        isTrackingActive={isTrackingActive}
-        lastTrackingResult={lastTrackingResult}
-        onRefreshGPS={() => requestGPSLocation(false)}
-        supabase={getClient()}
-        driverId={currentDriver?.id || null}
-        routeDistance={
-          mapModalTarget?.order?.id
-            ? routeDistances[getOrderRouteKey(mapModalTarget.orderType, mapModalTarget.order.id)]
-            : null
-        }
-        onRecalculateRoute={recalculateOrderRoute}
+        autoLaunchedExternal={Boolean(mapModalTarget?.autoLaunchedExternal)}
+        onCallPhone={callCustomer}
       />
     </div>
   );

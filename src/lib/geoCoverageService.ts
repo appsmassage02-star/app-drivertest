@@ -370,8 +370,8 @@ export async function hydrateOrdersGeoFromAddresses(
     const missingCoords =
       mode === 'pharmacy'
         ? row.address_latitude == null || row.address_longitude == null
-        : (row.delivery_latitude == null && row.address_longitude == null) ||
-          (row.address_latitude == null && row.address_longitude == null);
+        : (row.delivery_latitude == null && row.address_latitude == null) ||
+          (row.delivery_longitude == null && row.address_longitude == null);
 
     if (missingCentralIds || (missingCoords && !row.household_addresses)) {
       addressIds.add(String(addrId));

@@ -13,24 +13,21 @@ import {
   Clock,
   AlertTriangle,
 } from 'lucide-react';
-import type { DeliveryDriver, RouteDistanceResult } from '../types';
-import type { DriverGPSLocation } from '../lib/gpsService';
+import type { DeliveryDriver } from '../types';
 import { extractOrderFinancialBreakdown } from '../lib/geoCoverageService';
 import { DeliveryOrder, formatSafeTime, formatSafeDateTime } from '../App';
 
 interface HouseholdOrderCardProps {
   order: DeliveryOrder;
   currentDriver?: DeliveryDriver | null;
-  driverLocation?: DriverGPSLocation | null;
-  routeDistance?: RouteDistanceResult | null;
   sequenceNumber?: number;
-  navigationEnabled?: boolean;
   canAccept: boolean;
   isWorking: boolean;
   isActionLoading: boolean;
   onOpenDetails: (order: DeliveryOrder) => void;
   onAcceptOrder: (order: DeliveryOrder) => void;
   onStartShopping: (order: DeliveryOrder) => void;
+  onStartDelivery?: (order: DeliveryOrder) => void;
   onCompleteOrder: (order: DeliveryOrder) => void;
   onRequestCancellation: (order: DeliveryOrder) => void;
   onCallCustomer: (phone: string) => void;
@@ -81,15 +78,14 @@ function getHouseholdStatusBadge(status: DeliveryOrder['status']) {
 export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
   order,
   currentDriver,
-  routeDistance,
   sequenceNumber,
-  navigationEnabled = true,
   canAccept,
   isWorking,
   isActionLoading,
   onOpenDetails,
   onAcceptOrder,
   onStartShopping,
+  onStartDelivery,
   onCompleteOrder,
   onRequestCancellation,
   onCallCustomer,
@@ -106,17 +102,6 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
   const canCancel =
     (order.status === 'accepted' || order.status === 'shopping') &&
     isAssignedToCurrent;
-
-  const hasRoadDistance = routeDistance?.status === 'road_distance';
-  const distanceLabel = hasRoadDistance
-    ? `${routeDistance.formattedDistance}${
-        routeDistance.formattedDuration ? ` • ${routeDistance.formattedDuration}` : ''
-      }`
-    : routeDistance?.status === 'loading'
-    ? 'جاري حساب الطريق...'
-    : routeDistance?.status === 'disabled' || !navigationEnabled
-    ? 'الملاحة متوقفة'
-    : 'مسافة الطريق غير متاحة';
 
   const fin = extractOrderFinancialBreakdown(order);
 
@@ -162,7 +147,7 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
       </div>
 
       <div className="p-4 sm:p-5 space-y-3.5">
-        {/* Customer & Location Row + Distance Pill */}
+        {/* Customer & Location Row */}
         <div className="bg-slate-50/80 rounded-xl p-3.5 border border-slate-200/70 space-y-2 text-xs">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2 min-w-0">
@@ -177,21 +162,6 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
                   {order.customer_name || 'عميل طلباتي'}
                 </strong>
               </div>
-            </div>
-
-            <div
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border tabular-nums ${
-                hasRoadDistance
-                  ? 'bg-blue-50 text-blue-800 border-blue-200'
-                  : 'bg-slate-100 text-slate-500 border-slate-200'
-              }`}
-              title={
-                routeDistance?.errorReason ||
-                'مسافة الطريق الفعلي من موقعك الحالي إلى عنوان العميل'
-              }
-            >
-              <Navigation className="w-3.5 h-3.5 shrink-0" />
-              <span>{distanceLabel}</span>
             </div>
           </div>
 
@@ -435,15 +405,26 @@ export const HouseholdOrderCard: React.FC<HouseholdOrderCardProps> = ({
           )}
 
           {canComplete && (
-            <button
-              type="button"
-              disabled={isActionLoading}
-              onClick={() => onCompleteOrder(order)}
-              className="min-h-[40px] px-4 py-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center gap-1.5 cursor-pointer"
-            >
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              <span>إتمام التوصيل</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => (onStartDelivery ? onStartDelivery(order) : onOpenMap(order))}
+                className="min-h-[44px] px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl text-xs font-extrabold shadow-xs transition flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <Navigation className="w-3.5 h-3.5" />
+                <span>بدء التوصيل</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={isActionLoading}
+                onClick={() => onCompleteOrder(order)}
+                className="min-h-[44px] px-4 py-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>إتمام التوصيل</span>
+              </button>
+            </>
           )}
 
           {canCancel && (

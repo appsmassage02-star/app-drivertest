@@ -21,6 +21,7 @@ import {
   RefreshCw,
   WifiOff,
   Lock,
+  Navigation,
 } from 'lucide-react';
 import {
   PharmacyOrder,
@@ -84,6 +85,7 @@ interface PharmacyOrderDetailsModalProps {
   onOpenCancellationModal: (order: PharmacyOrder) => void;
   onCallCustomer: (phone: string) => void;
   onOpenMap?: (order: PharmacyOrder) => void;
+  onStartDelivery?: (order: PharmacyOrder) => void;
 }
 
 const PRESET_SHORTAGE_REASONS = [
@@ -123,6 +125,7 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
   onOpenCancellationModal,
   onCallCustomer,
   onOpenMap,
+  onStartDelivery,
 }) => {
   // Active item resolution form state
   const [activeItemId, setActiveItemId] = useState<string | null>(null);
@@ -1849,11 +1852,11 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
               <button
                 type="button"
                 onClick={() => onOpenMap(order)}
-                className="px-3.5 py-2 bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs"
-                title="فتح شاشة الخرائط وملاحة الـ GPS"
+                className="min-h-[44px] px-3.5 py-2 bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-300 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 space-x-reverse cursor-pointer shadow-2xs whitespace-nowrap"
+                title="عرض موقع العميل على الخريطة"
               >
                 <MapPin className="w-3.5 h-3.5 text-teal-700" />
-                <span>الخريطة والملاحة</span>
+                <span>خريطة الوجهة</span>
               </button>
             )}
 
@@ -1896,15 +1899,30 @@ export const PharmacyOrderDetailsModal: React.FC<PharmacyOrderDetailsModalProps>
             )}
 
             {order.status === 'ready_for_delivery' && isAssignedToMe && (
-              <button
-                type="button"
-                disabled={isActionLoading}
-                onClick={() => onCompleteDelivery(order.id)}
-                className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center space-x-1.5 space-x-reverse cursor-pointer"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>إتمام التوصيل</span>
-              </button>
+              <>
+                {(onStartDelivery || onOpenMap) && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onStartDelivery ? onStartDelivery(order) : onOpenMap?.(order)
+                    }
+                    className="min-h-[44px] px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl text-xs font-extrabold shadow-xs transition flex items-center space-x-1.5 space-x-reverse cursor-pointer whitespace-nowrap"
+                  >
+                    <Navigation className="w-3.5 h-3.5" />
+                    <span>بدء التوصيل</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  disabled={isActionLoading}
+                  onClick={() => onCompleteDelivery(order.id)}
+                  className="min-h-[44px] px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold shadow-xs transition flex items-center space-x-1.5 space-x-reverse cursor-pointer whitespace-nowrap"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>إتمام التوصيل</span>
+                </button>
+              </>
             )}
 
             <button

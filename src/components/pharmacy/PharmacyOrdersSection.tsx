@@ -6,8 +6,7 @@ import { PharmacyOrderCard } from './PharmacyOrderCard';
 import { PharmacyOrderDetailsModal } from './PharmacyOrderDetailsModal';
 import { PharmacyCancellationModal } from './PharmacyCancellationModal';
 import type { DeliveryDriver } from '../../App';
-import type { AppSectionSettingsState, CentralGeoContext, RouteDistanceResult } from '../../types';
-import type { DriverGPSLocation } from '../../lib/gpsService';
+import type { AppSectionSettingsState, CentralGeoContext } from '../../types';
 import { evaluateSectionOperationalStatus } from '../../lib/sectionSettingsService';
 import { sortOrdersOldestFirst } from '../../lib/orderDisplayHelpers';
 
@@ -15,9 +14,6 @@ interface PharmacyOrdersSectionProps {
   activeTab: 'pending' | 'accepted' | 'completed' | 'cancelled' | 'profile' | 'settings';
   searchQuery: string;
   currentDriver: DeliveryDriver | null;
-  driverLocation?: DriverGPSLocation | null;
-  routeDistances?: Record<string, RouteDistanceResult>;
-  navigationEnabled?: boolean;
   hideCardsList?: boolean;
   isWorking?: boolean;
   deliveryEnabled: boolean;
@@ -78,15 +74,13 @@ interface PharmacyOrdersSectionProps {
   ) => Promise<boolean>;
   onCallCustomer: (phone: string) => void;
   onOpenMap?: (order: PharmacyOrder) => void;
+  onStartDelivery?: (order: PharmacyOrder) => void;
 }
 
 export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   activeTab,
   searchQuery,
   currentDriver,
-  driverLocation = null,
-  routeDistances = {},
-  navigationEnabled = true,
   hideCardsList = false,
   isWorking = true,
   deliveryEnabled,
@@ -118,6 +112,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
   onRequestCancellation,
   onCallCustomer,
   onOpenMap,
+  onStartDelivery,
 }) => {
   const [internalCancellationTargetOrder, setInternalCancellationTargetOrder] =
     useState<PharmacyOrder | null>(null);
@@ -325,16 +320,14 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
                   key={order.id}
                   order={order}
                   currentDriverId={currentDriver?.id}
-                  driverLocation={driverLocation}
-                  routeDistance={routeDistances[`pharmacy:${order.id}`]}
                   sequenceNumber={idx + 1}
-                  navigationEnabled={navigationEnabled}
                   canAccept={canAcceptBase && order.status === 'pending_review'}
                   isWorking={isWorking}
                   isActionLoading={isPharmacyActionLoading}
                   onOpenDetails={(ord) => onSelectPharmacyOrder(ord)}
                   onAcceptOrder={onAcceptOrder}
                   onStartShopping={onStartShopping}
+                  onStartDelivery={onStartDelivery}
                   onCompleteDelivery={onCompleteDelivery}
                   onRequestCancellation={(ord) => setCancellationTargetOrder(ord)}
                   onCallCustomer={onCallCustomer}
@@ -369,6 +362,7 @@ export const PharmacyOrdersSection: React.FC<PharmacyOrdersSectionProps> = ({
         onOpenCancellationModal={(ord) => setCancellationTargetOrder(ord)}
         onCallCustomer={onCallCustomer}
         onOpenMap={onOpenMap}
+        onStartDelivery={onStartDelivery}
       />
 
       {/* Pharmacy Request Cancellation Modal */}
